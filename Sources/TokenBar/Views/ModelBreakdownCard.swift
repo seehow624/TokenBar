@@ -152,7 +152,7 @@ struct ModelBreakdownCard: View {
         return GeometryReader { geo in
             HStack(spacing: 1) {
                 ForEach(segments.indices, id: \.self) { i in
-                    RoundedRectangle(cornerRadius: 1.5)
+                    Rectangle()
                         .fill(Color(hex: segments[i].color))
                         .frame(
                             width: scaleTotal > 0
@@ -160,8 +160,9 @@ struct ModelBreakdownCard: View {
                                 : 0)
                 }
             }
+            .clipShape(Capsule())
         }
-        .frame(height: 6)
+        .frame(height: MeterBar.height)
     }
 
     // MARK: - Hover tooltip

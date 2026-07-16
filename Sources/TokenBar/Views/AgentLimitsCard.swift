@@ -464,22 +464,15 @@ struct AgentLimitsCard: View {
     private func bar(
         fillPercent: Double, color: Color, paceLeft: Double?, paceIsDeficit: Bool
     ) -> some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                Capsule().fill(.quaternary.opacity(0.6))
-                Capsule()
-                    .fill(color.opacity(0.85))
-                    .frame(width: geo.size.width * fillPercent / 100)
-                if let paceLeft {
-                    RoundedRectangle(cornerRadius: 0.75)
-                        .fill(paceIsDeficit ? Color.orange : Color.secondary)
-                        .frame(width: 1.5, height: geo.size.height + 4)
-                        .offset(x: geo.size.width * paceLeft / 100 - 0.75)
-                        .help("Expected \(Int((asUsed ? paceLeft : 100 - paceLeft).rounded()))% used by now")
-                }
-            }
-        }
-        .frame(height: 6)
+        MeterBar(
+            fraction: fillPercent / 100,
+            color: color,
+            marker: paceLeft.map { left in
+                MeterBar.Marker(
+                    fraction: left / 100,
+                    isDeficit: paceIsDeficit,
+                    help: "Expected \(Int((asUsed ? left : 100 - left).rounded()))% used by now")
+            })
     }
 
     /// The live tail reports raw client ids; quota snapshots use short ids.

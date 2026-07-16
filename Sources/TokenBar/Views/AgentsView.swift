@@ -58,16 +58,7 @@ struct AgentsView: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(.quaternary.opacity(0.5))
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.accentColor.opacity(0.7))
-                        .frame(width: geo.size.width * CGFloat(entry.cost / maxCost))
-                }
-            }
-            .frame(height: 6)
+            MeterBar(fraction: entry.cost / maxCost, color: .accentColor)
             HStack {
                 Text(sources)
                     .foregroundStyle(.tertiary)
