@@ -41,7 +41,7 @@ fn parse_settings_usage(html: &str, now: DateTime<Utc>) -> Vec<UsageWindow> {
     let text = quota_html::strip_tags(html);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let markers: [(&str, &str, Option<i64>); 2] = [
-        ("Session usage", "Session", None), // session length not published
+        ("Session usage", "5h", Some(300)), // Ollama session window is a rolling 5h
         ("Weekly usage", "Weekly", Some(10080)),
     ];
     let mut windows = Vec::new();
@@ -148,7 +148,7 @@ mod tests {
             <label>Notify me when I'm close to hitting my usage limits</label>"#;
         let windows = parse_settings_usage(html, now);
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label_for_test(), "Session");
+        assert_eq!(windows[0].label_for_test(), "5h");
         assert!((windows[0].remaining_for_test() - 88.0).abs() < 0.01);
         assert_eq!(windows[1].label_for_test(), "Weekly");
         assert!((windows[1].remaining_for_test() - 97.0).abs() < 0.01);
@@ -170,7 +170,7 @@ mod tests {
         );
         let windows = parse_settings_usage(html, now);
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label_for_test(), "Session");
+        assert_eq!(windows[0].label_for_test(), "5h");
         assert!((windows[0].remaining_for_test() - 100.0).abs() < 0.01);
         assert!(windows[0].reset_text_for_test().is_some());
         assert_eq!(windows[1].label_for_test(), "Weekly");
