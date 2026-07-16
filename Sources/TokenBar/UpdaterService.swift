@@ -17,6 +17,11 @@ final class UpdaterService: NSObject, SPUUpdaterDelegate {
 
     static var isAvailable: Bool { Bundle.main.bundleURL.pathExtension == "app" }
 
+    /// mod/go-ollama-quota: this fork must not self-update from the upstream
+    /// appcast — an upstream release would silently overwrite the local
+    /// patches. Flip back when the fork tracks its own appcast.
+    private static let autoUpdateDisabled = true
+
     /// Display version of an available update (nil = up to date / unknown).
     private(set) var availableVersion: String?
 
@@ -25,7 +30,7 @@ final class UpdaterService: NSObject, SPUUpdaterDelegate {
 
     private override init() {
         super.init()
-        guard Self.isAvailable else { return }
+        guard Self.isAvailable, !Self.autoUpdateDisabled else { return }
         controller = SPUStandardUpdaterController(
             startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
         probeTask = Task { [weak self] in
