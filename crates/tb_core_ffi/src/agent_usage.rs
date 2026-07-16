@@ -2,6 +2,7 @@ use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
 use crate::agent_history;
+use crate::agent_ollama;
 use crate::agent_opencode_go;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -316,13 +317,14 @@ struct ClaudeRefreshResponse {
 
 pub async fn run() -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (codex, claude, antigravity, copilot, grok, opencode_go) = tokio::join!(
+    let (codex, claude, antigravity, copilot, grok, opencode_go, ollama) = tokio::join!(
         fetch_codex(),
         fetch_claude(),
         fetch_antigravity(),
         fetch_copilot(),
         fetch_grok(),
-        fetch_opencode_go()
+        fetch_opencode_go(),
+        fetch_ollama()
     );
     let mut agents = vec![codex, claude, antigravity];
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
@@ -336,6 +338,10 @@ pub async fn run() -> AgentUsagePayload {
     // OpenCode Go only appears when opencode has an opencode-go credential.
     if let Some(opencode_go) = opencode_go {
         agents.push(opencode_go);
+    }
+    // Ollama only appears on machines that have ~/.ollama.
+    if let Some(ollama) = ollama {
+        agents.push(ollama);
     }
     AgentUsagePayload {
         generated_at,
@@ -402,6 +408,23 @@ async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
     let data = agent_opencode_go::fetch(now).await;
     Some(AgentUsageSnapshot {
         client_id: "opencode".to_string(),
+        source: data.source,
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: data.identity,
+        windows: data.windows,
+        credits: None,
+        error: data.error,
+    })
+}
+
+async fn fetch_ollama() -> Option<AgentUsageSnapshot> {
+    if !agent_ollama::ollama_present() {
+        return None;
+    }
+    let now = Utc::now();
+    let data = agent_ollama::fetch(now).await;
+    Some(AgentUsageSnapshot {
+        client_id: "ollama".to_string(),
         source: data.source,
         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
         identity: data.identity,

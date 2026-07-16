@@ -18,6 +18,7 @@ mod agent_antigravity;
 mod agent_copilot;
 mod agent_grok;
 mod agent_history;
+mod agent_ollama;
 mod agent_opencode_go;
 mod quota_html;
 mod agent_usage;
