@@ -196,9 +196,18 @@ mod tests {
     fn parses_reset_durations() {
         let now = Utc::now();
         let cases = [
-            ("Resets in 3 hours 4 minutes", Duration::hours(3) + Duration::minutes(4)),
-            ("Resets in 3 days 15 hours", Duration::days(3) + Duration::hours(15)),
-            ("Resets in 23 days 3 hours", Duration::days(23) + Duration::hours(3)),
+            (
+                "Resets in 3 hours 4 minutes",
+                Duration::hours(3) + Duration::minutes(4),
+            ),
+            (
+                "Resets in 3 days 15 hours",
+                Duration::days(3) + Duration::hours(15),
+            ),
+            (
+                "Resets in 23 days 3 hours",
+                Duration::days(23) + Duration::hours(3),
+            ),
             ("Resets in 1 minute", Duration::minutes(1)),
             ("Resets in 2 hours.", Duration::hours(2)), // ollama copy ends with a period
         ];
@@ -212,7 +221,10 @@ mod tests {
     fn reset_parse_survives_out_of_range_magnitudes() {
         let now = Utc::now();
         // Absurd magnitudes must degrade (skip/None), never panic.
-        assert_eq!(parse_resets_in("Resets in 9223372036854775807 days", now), None);
+        assert_eq!(
+            parse_resets_in("Resets in 9223372036854775807 days", now),
+            None
+        );
         let mixed = parse_resets_in("Resets in 9223372036854775807 days 2 hours", now);
         assert_eq!(mixed, Some(now + Duration::hours(2)));
     }
@@ -226,12 +238,18 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].label, "Rolling Usage");
         assert_eq!(items[0].used_percent, 4.0);
-        assert_eq!(items[0].resets_text.as_deref(), Some("Resets in 3 hours 0 minutes"));
+        assert_eq!(
+            items[0].resets_text.as_deref(),
+            Some("Resets in 3 hours 0 minutes")
+        );
         assert_eq!(items[1].label, "Weekly Usage");
         assert_eq!(items[1].used_percent, 29.0);
         assert_eq!(items[2].label, "Monthly Usage");
         assert_eq!(items[2].used_percent, 25.0);
-        assert_eq!(items[2].resets_text.as_deref(), Some("Resets in 23 days 3 hours"));
+        assert_eq!(
+            items[2].resets_text.as_deref(),
+            Some("Resets in 23 days 3 hours")
+        );
     }
 
     #[test]
