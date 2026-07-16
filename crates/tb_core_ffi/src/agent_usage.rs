@@ -1700,11 +1700,16 @@ fn codex_windows(
             std::mem::swap(&mut primary, &mut secondary);
         }
 
+        // Label by the window's actual length, not its slot: plans report
+        // arbitrary windows (ChatGPT Free ships a single 30-day window that
+        // positional "5h" would mislabel).
         if let Some(window) = primary {
-            windows.push(map_window("5h", window, now));
+            let label = codex_duration_label(&window, "5h");
+            windows.push(map_window(&label, window, now));
         }
         if let Some(window) = secondary {
-            windows.push(map_window("Weekly", window, now));
+            let label = codex_duration_label(&window, "Weekly");
+            windows.push(map_window(&label, window, now));
         }
     }
 
@@ -2008,6 +2013,18 @@ fn role(window: Option<&CodexWindow>) -> Option<&'static str> {
     }
 }
 
+/// Bucket a Codex window into the shared label family by its reported length:
+/// ≤6h reads as the "5h" bucket, up to ~10 days as "Weekly", anything longer
+/// as "Monthly". Windows without a reported length keep the slot fallback.
+fn codex_duration_label(window: &CodexWindow, fallback: &str) -> String {
+    match window.limit_window_seconds {
+        s if s <= 0 => fallback.to_string(),
+        s if s <= 21_600 => "5h".to_string(),
+        s if s <= 907_200 => "Weekly".to_string(),
+        _ => "Monthly".to_string(),
+    }
+}
+
 pub(crate) fn reset_text(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let seconds = (reset - now).num_seconds();
     if seconds <= 0 {
@@ -2291,6 +2308,35 @@ mod tests {
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].remaining_percent, 65.0);
+    }
+
+    /// ChatGPT Free reports a single 30-day window in the primary slot; the
+    /// label must follow the reported length, not the slot position.
+    #[test]
+    fn labels_codex_windows_by_duration_not_slot() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let rate_limit = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 100.0,
+                reset_at: 1_700_142_000,
+                limit_window_seconds: 43_200 * 60, // 30 days
+            }),
+            secondary_window: None,
+        };
+        let windows = codex_windows(Some(&rate_limit), None, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Monthly");
+        // Unreported length falls back to the slot label.
+        let unreported = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 1.0,
+                reset_at: 0,
+                limit_window_seconds: 0,
+            }),
+            secondary_window: None,
+        };
+        let windows = codex_windows(Some(&unreported), None, now);
+        assert_eq!(windows[0].label, "5h");
     }
 
     #[test]

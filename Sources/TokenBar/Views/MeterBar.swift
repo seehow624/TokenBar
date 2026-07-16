@@ -34,9 +34,11 @@ struct MeterBar: View {
                     .fill(color.opacity(Self.fillOpacity))
                     .frame(width: geo.size.width * min(max(fraction, 0), 1))
                 if let marker {
+                    // The tick stays inside the capsule: a taller tick makes
+                    // marked bars read thicker than unmarked ones.
                     RoundedRectangle(cornerRadius: 0.75)
                         .fill(marker.isDeficit ? Color.orange : Color.secondary)
-                        .frame(width: 1.5, height: geo.size.height + 4)
+                        .frame(width: 1.5, height: geo.size.height)
                         .offset(x: geo.size.width * min(max(marker.fraction, 0), 1) - 0.75)
                         .help(marker.help)
                 }
