@@ -40,15 +40,20 @@ fn workspace_cache_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("TokenBar").join("opencode-workspace"))
 }
 
-async fn discover_workspace_id() -> Result<String, CookieFetchError> {
+fn read_cached_workspace_id() -> Option<String> {
+    let path = workspace_cache_path()?;
+    let cached = std::fs::read_to_string(path).ok()?;
+    let cached = cached.trim().to_string();
+    (!cached.is_empty()).then_some(cached)
+}
+
+fn clear_cached_workspace_id() {
     if let Some(path) = workspace_cache_path() {
-        if let Ok(cached) = std::fs::read_to_string(&path) {
-            let cached = cached.trim().to_string();
-            if !cached.is_empty() {
-                return Ok(cached);
-            }
-        }
+        let _ = std::fs::remove_file(path);
     }
+}
+
+async fn discover_workspace_id() -> Result<String, CookieFetchError> {
     // Signed-in /auth redirects to /workspace/<id>; a login page means the
     // cookie is missing/expired.
     let page = quota_html::fetch_with_cookie(AUTH_URL, COOKIE_KEYCHAIN_SERVICE).await?;
@@ -68,10 +73,7 @@ async fn discover_workspace_id() -> Result<String, CookieFetchError> {
     Ok(id)
 }
 
-async fn fetch_official(now: DateTime<Utc>) -> Result<OpenCodeGoData, String> {
-    let workspace = discover_workspace_id()
-        .await
-        .map_err(|e| e.message(CONNECT_HINT))?;
+async fn fetch_go_windows(workspace: &str, now: DateTime<Utc>) -> Result<OpenCodeGoData, String> {
     let url = format!("https://opencode.ai/workspace/{workspace}/go");
     let page = quota_html::fetch_with_cookie(&url, COOKIE_KEYCHAIN_SERVICE)
         .await
@@ -92,6 +94,32 @@ async fn fetch_official(now: DateTime<Utc>) -> Result<OpenCodeGoData, String> {
     })
 }
 
+async fn fetch_official(now: DateTime<Utc>) -> Result<OpenCodeGoData, String> {
+    let cached = read_cached_workspace_id();
+    let workspace = match &cached {
+        Some(id) => id.clone(),
+        None => discover_workspace_id()
+            .await
+            .map_err(|e| e.message(CONNECT_HINT))?,
+    };
+    match fetch_go_windows(&workspace, now).await {
+        Ok(data) => Ok(data),
+        // A failure on a *cached* id may just mean the id went stale (workspace
+        // switched/deleted) — drop the cache and retry once with a fresh discovery.
+        Err(first_failure) if cached.is_some() => {
+            clear_cached_workspace_id();
+            let fresh = discover_workspace_id()
+                .await
+                .map_err(|e| e.message(CONNECT_HINT))?;
+            if fresh == workspace {
+                return Err(first_failure);
+            }
+            fetch_go_windows(&fresh, now).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Documented Go limits: (label, lookback minutes, dollar limit, window_minutes).
 const GO_LIMITS: &[(&str, i64, f64, Option<i64>)] = &[
     ("5h", 5 * 60, 12.0, Some(300)),
@@ -105,21 +133,38 @@ fn opencode_db_path() -> Option<PathBuf> {
 }
 
 fn local_estimate_windows(db: &rusqlite::Connection, now: DateTime<Utc>) -> Vec<UsageWindow> {
+    let since_ms: Vec<i64> = GO_LIMITS
+        .iter()
+        .map(|(_, lookback_minutes, _, _)| {
+            (now - Duration::minutes(*lookback_minutes)).timestamp_millis()
+        })
+        .collect();
+    // One scan over the widest (monthly) lookback, bucketed into the three
+    // windows via conditional aggregation. The subselect clamps each cost
+    // with SQLite's scalar MAX — opencode has emitted negative costs, and
+    // COALESCE maps a missing cost to 0 before the clamp.
+    let spent: [f64; 3] = db
+        .query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN time_created >= ?1 THEN cost END), 0.0),
+                COALESCE(SUM(CASE WHEN time_created >= ?2 THEN cost END), 0.0),
+                COALESCE(SUM(cost), 0.0)
+             FROM (
+                SELECT time_created,
+                       MAX(COALESCE(CAST(json_extract(data,'$.cost') AS REAL), 0.0), 0.0) AS cost
+                FROM message
+                WHERE time_created >= ?3
+                  AND json_extract(data,'$.providerID') = 'opencode-go'
+                  AND json_extract(data,'$.role') = 'assistant'
+             )",
+            rusqlite::params![since_ms[0], since_ms[1], since_ms[2]],
+            |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]),
+        )
+        .unwrap_or([0.0; 3]);
     GO_LIMITS
         .iter()
-        .map(|(label, lookback_minutes, dollar_limit, window_minutes)| {
-            let since_ms = (now - Duration::minutes(*lookback_minutes)).timestamp_millis();
-            let spent: f64 = db
-                .query_row(
-                    "SELECT COALESCE(SUM(CAST(json_extract(data,'$.cost') AS REAL)), 0)
-                     FROM message
-                     WHERE time_created >= ?1
-                       AND json_extract(data,'$.providerID') = 'opencode-go'
-                       AND json_extract(data,'$.role') = 'assistant'",
-                    [since_ms],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0.0);
+        .zip(spent)
+        .map(|((label, _, dollar_limit, window_minutes), spent)| {
             UsageWindow::from_used_percent(
                 format!("{label} (est.)"),
                 spent / dollar_limit * 100.0,
@@ -170,7 +215,16 @@ fn fetch_local_estimate(now: DateTime<Utc>, official_failure: String) -> OpenCod
 pub(crate) async fn fetch(now: DateTime<Utc>) -> OpenCodeGoData {
     match fetch_official(now).await {
         Ok(data) => data,
-        Err(reason) => fetch_local_estimate(now, reason),
+        // The estimate does synchronous sqlite I/O — run it off the async
+        // executor so a slow disk can't stall the other providers' futures.
+        Err(reason) => tokio::task::spawn_blocking(move || fetch_local_estimate(now, reason))
+            .await
+            .unwrap_or_else(|join_err| OpenCodeGoData {
+                identity: None,
+                windows: Vec::new(),
+                source: "local estimate".to_string(),
+                error: Some(format!("local estimate task failed: {join_err}")),
+            }),
     }
 }
 
@@ -233,5 +287,34 @@ mod tests {
         assert_eq!(windows[0].label_for_test(), "5h (est.)");
         assert_eq!(windows[1].label_for_test(), "Weekly (est.)");
         assert_eq!(windows[2].label_for_test(), "Monthly (est.)");
+    }
+
+    #[test]
+    fn local_estimate_clamps_negative_costs() {
+        let now = Utc::now();
+        let ms = |min_ago: i64| (now - Duration::minutes(min_ago)).timestamp_millis();
+        let db = seed_db(&[
+            (ms(60), r#"{"role":"assistant","providerID":"opencode-go","cost":6.0}"#),
+            // opencode has emitted negative costs — clamp to 0, never subtract
+            (ms(30), r#"{"role":"assistant","providerID":"opencode-go","cost":-3.0}"#),
+            // a missing cost counts as 0
+            (ms(20), r#"{"role":"assistant","providerID":"opencode-go"}"#),
+        ]);
+        let windows = local_estimate_windows(&db, now);
+        // 5h window: $6 of $12 → 50% remaining (the -3 and null rows add 0)
+        assert!((windows[0].remaining_for_test() - 50.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn local_estimate_includes_boundary_row() {
+        let now = Utc::now();
+        // A row exactly at the window edge (time_created == since_ms) counts (>=).
+        let since_ms = (now - Duration::minutes(5 * 60)).timestamp_millis();
+        let db = seed_db(&[(
+            since_ms,
+            r#"{"role":"assistant","providerID":"opencode-go","cost":12.0}"#,
+        )]);
+        let windows = local_estimate_windows(&db, now);
+        assert!(windows[0].remaining_for_test().abs() < 0.01);
     }
 }
