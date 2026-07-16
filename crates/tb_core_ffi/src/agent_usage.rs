@@ -2,6 +2,7 @@ use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
 use crate::agent_history;
+use crate::agent_opencode_go;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -315,12 +316,13 @@ struct ClaudeRefreshResponse {
 
 pub async fn run() -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (codex, claude, antigravity, copilot, grok) = tokio::join!(
+    let (codex, claude, antigravity, copilot, grok, opencode_go) = tokio::join!(
         fetch_codex(),
         fetch_claude(),
         fetch_antigravity(),
         fetch_copilot(),
-        fetch_grok()
+        fetch_grok(),
+        fetch_opencode_go()
     );
     let mut agents = vec![codex, claude, antigravity];
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
@@ -330,6 +332,10 @@ pub async fn run() -> AgentUsagePayload {
     // Grok only appears when ~/.grok/auth.json has credentials.
     if let Some(grok) = grok {
         agents.push(grok);
+    }
+    // OpenCode Go only appears when opencode has an opencode-go credential.
+    if let Some(opencode_go) = opencode_go {
+        agents.push(opencode_go);
     }
     AgentUsagePayload {
         generated_at,
@@ -385,6 +391,23 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
             credits: None,
             error: Some(error),
         },
+    })
+}
+
+async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
+    if !crate::opencode_integrations::has_opencode_go() {
+        return None;
+    }
+    let now = Utc::now();
+    let data = agent_opencode_go::fetch(now).await;
+    Some(AgentUsageSnapshot {
+        client_id: "opencode".to_string(),
+        source: data.source,
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: data.identity,
+        windows: data.windows,
+        credits: None,
+        error: data.error,
     })
 }
 
