@@ -418,7 +418,7 @@ async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
 }
 
 async fn fetch_ollama() -> Option<AgentUsageSnapshot> {
-    if !agent_ollama::ollama_present() {
+    if !agent_ollama::has_ollama() {
         return None;
     }
     let now = Utc::now();

@@ -5,7 +5,7 @@
 //! Resets in …"); without one the card stays identity-only.
 
 use crate::agent_usage::{clean_plan, AgentIdentity, UsageWindow};
-use crate::quota_html::{self, CookieFetchError};
+use crate::quota_html;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
@@ -31,7 +31,7 @@ struct OllamaMe {
 }
 
 /// Gate: only show the card for machines that use ollama at all.
-pub(crate) fn ollama_present() -> bool {
+pub(crate) fn has_ollama() -> bool {
     std::env::var_os("HOME")
         .map(|home| std::path::PathBuf::from(home).join(".ollama").is_dir())
         .unwrap_or(false)
@@ -87,7 +87,7 @@ async fn fetch_identity() -> Result<AgentIdentity, String> {
         .post(ME_URL)
         .send()
         .await
-        .map_err(|_| "Ollama is not running (start the Ollama app to see account info).".to_string())?;
+        .map_err(|e| format!("Ollama not reachable at localhost:11434 ({e}). Start the Ollama app to see account info."))?;
     if !response.status().is_success() {
         return Err(format!("ollama /api/me returned {}. Run `ollama signin`.", response.status().as_u16()));
     }
@@ -106,13 +106,17 @@ async fn fetch_identity() -> Result<AgentIdentity, String> {
 }
 
 pub(crate) async fn fetch(now: DateTime<Utc>) -> OllamaData {
-    let identity = fetch_identity().await;
-    let (windows, source) =
-        match quota_html::fetch_with_cookie(SETTINGS_URL, COOKIE_KEYCHAIN_SERVICE).await {
-            Ok(page) => (parse_settings_usage(&page.body, now), "ollama.com".to_string()),
-            Err(CookieFetchError::MissingCookie) => (Vec::new(), "local".to_string()),
-            Err(_) => (Vec::new(), "local".to_string()), // expired cookie → identity-only card
-        };
+    let (identity, cookie_page) = tokio::join!(
+        fetch_identity(),
+        quota_html::fetch_with_cookie(SETTINGS_URL, COOKIE_KEYCHAIN_SERVICE)
+    );
+    let (windows, source) = match cookie_page {
+        Ok(page) => (parse_settings_usage(&page.body, now), "ollama.com".to_string()),
+        // Missing cookie (never connected) and failed cookie (expired / network)
+        // both degrade to the identity-only card; distinguishing them in the UI
+        // is deferred to the E2E pass (Task 11).
+        Err(_) => (Vec::new(), "local".to_string()),
+    };
     match identity {
         Ok(identity) => OllamaData {
             identity: Some(identity),
