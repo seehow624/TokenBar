@@ -1701,7 +1701,7 @@ fn codex_windows(
         }
 
         if let Some(window) = primary {
-            windows.push(map_window("Session", window, now));
+            windows.push(map_window("5h", window, now));
         }
         if let Some(window) = secondary {
             windows.push(map_window("Weekly", window, now));
@@ -1733,7 +1733,7 @@ fn codex_windows(
 
 fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageWindow> {
     let mut windows = Vec::new();
-    push_claude_window(&mut windows, "Session", usage.five_hour.as_ref(), now);
+    push_claude_window(&mut windows, "5h", usage.five_hour.as_ref(), now);
     push_claude_window(&mut windows, "Weekly", usage.seven_day.as_ref(), now);
     push_claude_window(
         &mut windows,
@@ -1831,7 +1831,7 @@ fn parse_unified_ratelimit_windows(
     };
     let mut windows = Vec::new();
     if let Some(window) = unified_ratelimit_window(
-        "Session",
+        "5h",
         read_f64("anthropic-ratelimit-unified-5h-utilization"),
         read_i64("anthropic-ratelimit-unified-5h-reset"),
         now,
@@ -1997,7 +1997,7 @@ fn map_window(label: &str, window: CodexWindow, now: DateTime<Utc>) -> UsageWind
 /// Standard Claude window lengths by label, since the API doesn't report them:
 /// the session bucket is 5h, everything else is the 7-day weekly family.
 fn claude_window_minutes(label: &str) -> Option<i64> {
-    Some(if label.eq_ignore_ascii_case("Session") { 300 } else { 10_080 })
+    Some(if label.eq_ignore_ascii_case("5h") { 300 } else { 10_080 })
 }
 
 fn role(window: Option<&CodexWindow>) -> Option<&'static str> {
@@ -2287,7 +2287,7 @@ mod tests {
         };
         let windows = codex_windows(Some(&rate_limit), None, now);
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].remaining_percent, 65.0);
@@ -2413,7 +2413,7 @@ mod tests {
         };
         let windows = claude_windows(&usage, now);
         assert_eq!(windows.len(), 4);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].remaining_percent, 77.0);
@@ -2438,7 +2438,7 @@ mod tests {
         let windows = claude_windows(&usage, now);
         assert_eq!(
             windows.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(),
-            vec!["Session", "Weekly", "Sonnet", "Designs", "Daily Routines"]
+            vec!["5h", "Weekly", "Sonnet", "Designs", "Daily Routines"]
         );
     }
 
@@ -2464,7 +2464,7 @@ mod tests {
         ]);
         let windows = parse_unified_ratelimit_windows(&headers, now);
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
         assert!((windows[0].used_percent - 11.0).abs() < 1e-9);
         assert!((windows[0].remaining_percent - 89.0).abs() < 1e-9);
         assert_eq!(windows[0].window_minutes, Some(300));
@@ -2497,7 +2497,7 @@ mod tests {
             now,
         );
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
 
         // unparseable 5h + valid 7d -> just Weekly
         let windows = parse_unified_ratelimit_windows(
@@ -2529,7 +2529,7 @@ mod tests {
         assert!((over.used_percent - 100.0).abs() < 1e-9);
         assert!((over.remaining_percent - 0.0).abs() < 1e-9);
         // None utilization -> no window
-        assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
+        assert!(unified_ratelimit_window("5h", None, Some(1_783_111_200), now).is_none());
     }
 
     #[test]
