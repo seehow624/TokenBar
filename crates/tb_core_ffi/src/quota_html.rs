@@ -16,15 +16,22 @@ pub(crate) fn parse_resets_in(text: &str, now: DateTime<Utc>) -> Option<DateTime
             let unit = tokens[i + 1]
                 .trim_end_matches(['.', ','])
                 .trim_end_matches('s');
+            // Checked constructors: out-of-range magnitudes degrade to
+            // "token doesn't match" instead of panicking — this text comes
+            // from a live third-party page and we sit behind an FFI boundary.
             let step = match unit {
-                "day" => Some(Duration::days(n)),
-                "hour" => Some(Duration::hours(n)),
-                "minute" => Some(Duration::minutes(n)),
-                "second" => Some(Duration::seconds(n)),
+                "day" => Duration::try_days(n),
+                "hour" => Duration::try_hours(n),
+                "minute" => Duration::try_minutes(n),
+                "second" => Duration::try_seconds(n),
                 _ => None,
             };
             if let Some(step) = step {
-                total = total + step;
+                let Some(next) = total.checked_add(&step) else {
+                    i += 2;
+                    continue;
+                };
+                total = next;
                 matched = true;
                 i += 2;
                 continue;
@@ -32,7 +39,7 @@ pub(crate) fn parse_resets_in(text: &str, now: DateTime<Utc>) -> Option<DateTime
         }
         i += 1;
     }
-    matched.then(|| now + total)
+    matched.then(|| now.checked_add_signed(total)).flatten()
 }
 
 #[derive(Debug, PartialEq)]
@@ -202,6 +209,15 @@ mod tests {
     }
 
     #[test]
+    fn reset_parse_survives_out_of_range_magnitudes() {
+        let now = Utc::now();
+        // Absurd magnitudes must degrade (skip/None), never panic.
+        assert_eq!(parse_resets_in("Resets in 9223372036854775807 days", now), None);
+        let mixed = parse_resets_in("Resets in 9223372036854775807 days 2 hours", now);
+        assert_eq!(mixed, Some(now + Duration::hours(2)));
+    }
+
+    #[test]
     fn parses_opencode_usage_items_from_fixture() {
         let html = include_str!(
             "../../../docs/superpowers/specs/fixtures/opencode-go-usage-fragment.html"
@@ -221,5 +237,30 @@ mod tests {
     #[test]
     fn parse_usage_items_empty_on_login_page() {
         assert!(parse_usage_items("<html><body>Sign in</body></html>").is_empty());
+    }
+
+    #[test]
+    fn parse_usage_items_accepts_decimal_percent() {
+        let html = r#"
+            <div data-slot="usage-item">
+              <span data-slot="usage-label">Rolling Usage</span>
+              <span data-slot="usage-value">4.5%</span>
+            </div>
+        "#;
+        let items = parse_usage_items(html);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].used_percent, 4.5);
+        assert_eq!(items[0].resets_text, None);
+    }
+
+    #[test]
+    fn strip_tags_extracts_visible_text() {
+        assert_eq!(
+            strip_tags("<div><span>Session usage</span><b>12% used</b></div>")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "Session usage 12% used"
+        );
     }
 }
