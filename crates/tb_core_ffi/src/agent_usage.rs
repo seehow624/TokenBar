@@ -142,6 +142,11 @@ impl UsageWindow {
     pub(crate) fn remaining_for_test(&self) -> f64 {
         self.remaining_percent
     }
+
+    #[cfg(test)]
+    pub(crate) fn reset_text_for_test(&self) -> Option<&str> {
+        self.reset_text.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]

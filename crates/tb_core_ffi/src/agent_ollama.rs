@@ -158,4 +158,23 @@ mod tests {
     fn settings_parse_empty_when_signed_out() {
         assert!(parse_settings_usage("<html>Sign in</html>", Utc::now()).is_empty());
     }
+
+    /// Real captured ollama.com/settings markup (de-identified, free-tier,
+    /// both windows at 0%). Guards against a markup change silently breaking
+    /// the text-anchor parser — the synthetic fixture above can't catch that.
+    #[test]
+    fn parses_usage_from_real_settings_fixture() {
+        let now = Utc::now();
+        let html = include_str!(
+            "../../../docs/superpowers/specs/fixtures/ollama-settings-usage-fragment.html"
+        );
+        let windows = parse_settings_usage(html, now);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label_for_test(), "Session");
+        assert!((windows[0].remaining_for_test() - 100.0).abs() < 0.01);
+        assert!(windows[0].reset_text_for_test().is_some());
+        assert_eq!(windows[1].label_for_test(), "Weekly");
+        assert!((windows[1].remaining_for_test() - 100.0).abs() < 0.01);
+        assert!(windows[1].reset_text_for_test().is_some());
+    }
 }
