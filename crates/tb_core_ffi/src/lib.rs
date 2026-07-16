@@ -18,6 +18,7 @@ mod agent_antigravity;
 mod agent_copilot;
 mod agent_grok;
 mod agent_history;
+mod quota_html;
 mod agent_usage;
 mod agents_report;
 mod hourly_report;
