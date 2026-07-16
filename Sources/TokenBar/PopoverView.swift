@@ -96,10 +96,11 @@ struct PopoverView: View {
                 .padding(.bottom, 10)
             Divider()
             ScrollView {
-                content
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(OverlayScrollerEnforcer())
+                if #available(macOS 26.0, *) {
+                    GlassEffectContainer(spacing: 12) { dashboardContent }
+                } else {
+                    dashboardContent
+                }
             }
             .clipped()
             Divider()
@@ -340,6 +341,17 @@ struct PopoverView: View {
         case .ready:
             lens
         }
+    }
+
+    /// The ScrollView's direct content — pulled out of `body` so both the
+    /// macOS 26 `GlassEffectContainer` branch and the macOS 14 fallback share
+    /// one definition (adjacent glass cards fuse inside the container; on 14
+    /// this renders exactly as before).
+    @ViewBuilder private var dashboardContent: some View {
+        content
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(OverlayScrollerEnforcer())
     }
 
     /// Lens router. The client tab picks *which* data (clientIds slice), the

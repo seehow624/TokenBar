@@ -16,12 +16,22 @@ struct ViewSwitch: View {
                     .padding(.horizontal, 4)
                     .padding(.vertical, 4)
                     .frame(maxWidth: .infinity)
-                    .background(
-                        active == view ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear),
-                        in: RoundedRectangle(cornerRadius: 6))
+                    .background { pillBackground(active: active == view) }
             }
         }
         .padding(2)
         .glassCard(cornerRadius: 8)
+    }
+
+    /// Selected pill: interactive Liquid Glass on macOS 26 (visually reacts
+    /// to hover/press), a flat quaternary fill on the macOS 14 fallback.
+    @ViewBuilder private func pillBackground(active: Bool) -> some View {
+        if active {
+            if #available(macOS 26.0, *) {
+                Color.clear.glassEffect(.regular.interactive(), in: .rect(cornerRadius: 6))
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(.quaternary)
+            }
+        }
     }
 }
