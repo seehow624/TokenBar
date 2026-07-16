@@ -27,7 +27,7 @@ struct AgentLimitsCard: View {
     var reorderable = false
 
     /// Bar fills by used (true) or remaining (false).
-    @AppStorage("tokenbar.limits.asUsed") private var asUsed = false
+    @AppStorage("tokenbar.limits.asUsed") private var asUsed = true
     @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
     @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
     /// Saved drag order (shared with the "Client tabs (top bar)" order in Settings).
