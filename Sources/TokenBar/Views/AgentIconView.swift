@@ -21,6 +21,7 @@ struct AgentIconView: View {
         "cline", "jcode", "micode", "gjc", "grok",
         // Newly onboarded brand icons (png/svg).
         "hermes", "roocode", "mux", "crush", "goose", "zed", "trae", "openclaw",
+        "ollama",
     ]
 
     /// Clients that share another client's brand icon. The Antigravity CLI is
