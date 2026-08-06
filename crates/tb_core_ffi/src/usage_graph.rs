@@ -98,16 +98,25 @@ struct TokenContributionData {
 
 /// Build the contribution-graph payload for `year` (empty string = all time).
 ///
+/// `home` is the scan home directory; `None` scans this machine's default
+/// roots (env-aware), `Some(path)` scans only the mirror layout under `path`
+/// (a remote machine's agent data rsynced into a fake home, see
+/// `tb_graph_remote`). A remote home scans with `use_env_roots = false` so
+/// `HERMES_HOME` / `CODEX_HOME` / `XDG_*` on this machine cannot leak into
+/// the remote view.
+///
 /// Invoked from `lib.rs` inside `spawn_blocking`, so the calling thread has no
 /// Tokio reactor — we spin up a short-lived current-thread runtime to drive
 /// the async `generate_local_graph_report`. That entry point uses cached
 /// pricing with a graceful offline fallback, and `PricingService` is a process
 /// -wide `OnceCell`, so the network fetch happens at most once per launch.
-pub fn run(year: &str) -> Result<Value, String> {
+pub fn run(year: &str, home: Option<&str>) -> Result<Value, String> {
     let year = normalize_year(year)?;
 
     let options = tokscale_core::ReportOptions {
         year,
+        home_dir: home.map(str::to_owned),
+        use_env_roots: home.is_none(),
         ..Default::default()
     };
 

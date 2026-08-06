@@ -196,6 +196,7 @@ struct PopoverView: View {
                 .font(.headline)
             Spacer()
             liveRateBadge
+            machineMenu
             yearMenu
             refreshButton
         }
@@ -232,6 +233,51 @@ struct PopoverView: View {
             .menuIndicator(.visible)
             .fixedSize()
             .help("Filter usage by year")
+        }
+    }
+
+    /// Machine scope for every lens: this machine only, a named remote
+    /// mirror, or all machines combined. Shown only when at least one remote
+    /// mirror is configured.
+    @ViewBuilder private var machineMenu: some View {
+        let machines = RemoteMachineStore.shared.enabledMachines
+        if !machines.isEmpty {
+            Menu {
+                Picker("Machine", selection: Binding(
+                    get: { model.machineScope ?? DashboardModel.MachineScope.local },
+                    set: { value in
+                        Task { await model.setMachineScope(value) }
+                    }
+                )) {
+                    Text("This machine").tag(DashboardModel.MachineScope.local)
+                    Text("All machines").tag(DashboardModel.MachineScope.combined)
+                    Divider()
+                    ForEach(machines) { machine in
+                        Text(machine.name).tag(machine.name)
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "desktopcomputer")
+                    Text(machineScopeLabel)
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.visible)
+            .fixedSize()
+            .help("Show usage for this machine, a remote machine, or all machines")
+        }
+    }
+
+    private var machineScopeLabel: String {
+        switch model.machineScope {
+        case .none, DashboardModel.MachineScope.local?: return "This"
+        case DashboardModel.MachineScope.combined?: return "All"
+        case let scope?: return scope
         }
     }
 

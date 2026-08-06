@@ -61,7 +61,20 @@ use std::time::UNIX_EPOCH;
 // snapshot instead of repeatedly measuring from the turn start. Schema-28
 // caches can replay overlapping duration_ms values or resume an incremental
 // parse without the new cursor, so unchanged sources must be rebuilt.)
-const CACHE_SCHEMA_VERSION: u32 = 29;
+// 30 (M15: Claude and Codex message timestamps are now start-anchored — Claude
+// anchors at the pending request-start and Codex at the last accepted token
+// snapshot — so a streaming-duplicate merge never shrinks an established
+// duration and resumed sessions cannot bridge backward across an idle gap
+// (#890). Schema-29 caches can carry completion-anchored timestamps and must
+// be rebuilt.)
+// 31 (M15: OpenCode SQLite parsing now also reads the v2 `session_message`
+// table (opencode-next.db) and keeps distinct embedded message ids apart
+// instead of collapsing same-fingerprint rows (#920); Hermes reads per-model
+// `session_model_usage` rows with (session, model, provider)-namespaced dedup
+// keys instead of crediting the whole session to one model (#961). Schema-30
+// caches can replay a v1-only, id-collapsed OpenCode parse or a single-model
+// Hermes parse for an unchanged database and must be rebuilt.)
+const CACHE_SCHEMA_VERSION: u32 = 31;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1805,6 +1818,90 @@ mod tests {
             assert!(
                 !rebuilt.entries[0].messages[0].is_turn_start,
                 "stale schema-24 turn flags must not survive the rebuild"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_29_cache_is_stale_and_rebuilt_as_current_schema() {
+        // M15 (#890): Claude and Codex message timestamps are now
+        // start-anchored, so schema-29 caches can carry completion-anchored
+        // timestamps whose durations would project into phantom idle time.
+        // Unchanged sources must rebuild rather than replay the old anchors.
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source = write_temp_file(b"schema-30-migration\n");
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let mut stale_message = UnifiedMessage::new(
+                "claude",
+                "claude-sonnet-4-5",
+                "anthropic",
+                "stale-anchor-session",
+                1_733_047_203_500,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            stale_message.duration_ms = Some(3_500);
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 29,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(loaded.entries.is_empty(), "schema-29 entries must be stale");
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale cache entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt_message = UnifiedMessage::new(
+                "claude",
+                "claude-sonnet-4-5",
+                "anthropic",
+                "rebuilt-anchor-session",
+                1_733_047_200_000,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            loaded.insert(CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint,
+                vec![rebuilt_message],
+                Vec::new(),
+                None,
+            ));
+            loaded.save_if_dirty();
+
+            let rebuilt = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(rebuilt.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(rebuilt.entries.len(), 1);
+            assert_eq!(
+                rebuilt.entries[0].messages[0].session_id, "rebuilt-anchor-session",
+                "the rebuilt entry must carry the start-anchored parse"
+            );
+            assert_eq!(
+                rebuilt.entries[0].messages[0].timestamp, 1_733_047_200_000,
+                "the start-anchored timestamp must survive the rebuild"
             );
         }
 

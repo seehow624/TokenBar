@@ -46,10 +46,11 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "openrouter/",
 ];
 
-// Bare brand tokens ("claude", "anthropic") are blocked because they contain
-// no model information: a fuzzy hit from them can land on any model of the
-// brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
-// opus-fast key), so such a match is never trustworthy.
+// Bare brand tokens ("claude", "anthropic", "gemini") are blocked because they
+// contain no model information: a fuzzy hit from them can land on any model of
+// the brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
+// opus-fast key, or `gemini-default` eroding to `gemini` and landing on a
+// native-audio preview key), so such a match is never trustworthy.
 //
 // Generic English words ("model", "router") are blocked for the same reason:
 // they carry no model identity, yet substring-match real priced keys
@@ -64,6 +65,7 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "base",
     "claude",
     "anthropic",
+    "gemini",
     "model",
     "router",
 ];
@@ -318,6 +320,32 @@ impl PricingLookup {
         let guarded_lookup = |candidate: &str| {
             do_lookup(candidate).filter(|result| !unsafe_claude_resolution(result))
         };
+
+        // 1.5. Generic provider-routing prefix fallback: ids coming from a
+        // router/proxy (e.g. `cx/gpt-5.5` via an `omniroute` provider) carry a
+        // prefix outside the curated `PROVIDER_PREFIXES` list, so the
+        // known-prefix stripping inside `lookup_auto` never fires for them.
+        // The direct exact lookup above already had first crack at the full
+        // id, so a dataset key that legitimately keeps its prefix (e.g.
+        // `anthropic/claude-fable-5`) resolves there and never reaches this
+        // fallback. Only the terminal path segment is retried here, matching
+        // the `/`-scoped fallbacks already used by the Cursor/Sakana exact
+        // matchers.
+        if let Some(terminal) = strip_generic_provider_prefix(lower_ref) {
+            if let Some(result) = guarded_lookup(terminal) {
+                return Some(result);
+            }
+
+            // The terminal segment can still carry a tier suffix, and the two
+            // transformations have to compose here or they never meet: the
+            // suffix stage below only ever sees the prefixed id, and it splits
+            // on `-`, so it can peel `-xhigh` off `cx/gpt-5.5-xhigh` but is
+            // left with `cx/gpt-5.5`, which is not a dataset key either. Both
+            // halves resolve alone while the combination billed $0 (#846).
+            if let Some(result) = try_strip_unknown_suffix(terminal, guarded_lookup) {
+                return Some(result);
+            }
+        }
 
         // 2. Try stripping unknown suffixes (e.g., -thinking, -high, -codex)
         if let Some(result) = try_strip_unknown_suffix(lower_ref, guarded_lookup) {
@@ -958,9 +986,11 @@ pub fn compute_cost(
     // because upstream LiteLLM does not currently declare 128k or 256k
     // cache-read pricing for any model. If upstream begins emitting
     // those keys, also add matching fields to `ModelPricing`,
-    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
-    // `has_meaningful_tier_support`; otherwise tier walks will silently
-    // undercost long-context cache reads on those models.
+    // `has_any_valid_above_tier_value`, and `has_meaningful_tier_support`;
+    // otherwise tier walks will silently undercost long-context cache reads
+    // on those models. `has_any_usable_pricing` needs no entry here: it reads
+    // `ModelPricing::all_rates`, whose exhaustive destructure fails to
+    // compile until the new field is added there.
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
@@ -1317,6 +1347,26 @@ fn strip_known_provider_prefix(model_id: &str) -> Option<&str> {
     None
 }
 
+/// Generic routing-prefix fallback for ids whose leading segment is not one
+/// of the curated `PROVIDER_PREFIXES` (e.g. `cx/gpt-5.5` routed through an
+/// `omniroute` proxy, or any other CLI/router-assigned alias). Returns the
+/// terminal path segment — the part after the last `/` — when the id
+/// actually contains a `/`, so `cx/gpt-5.5` resolves to `gpt-5.5`.
+///
+/// This is intentionally unconditional (unlike `strip_known_provider_prefix`,
+/// which only recognizes canonical LLM provider names): the caller only
+/// invokes it as a fallback AFTER the exact/direct lookup on the full id has
+/// already failed, so dataset keys that legitimately keep their prefix (e.g.
+/// `anthropic/claude-fable-5`) are resolved by their own exact key first and
+/// never reach this fallback.
+fn strip_generic_provider_prefix(model_id: &str) -> Option<&str> {
+    let terminal = model_id.rsplit('/').next()?;
+    if terminal.is_empty() || terminal == model_id {
+        return None;
+    }
+    Some(terminal)
+}
+
 fn is_valid_price_value(value: f64) -> bool {
     value.is_finite() && value >= 0.0
 }
@@ -1326,25 +1376,10 @@ fn is_valid_price_value(value: f64) -> bool {
 /// subscription-based providers like Perplexity) are useless for
 /// pay-per-token cost estimation and should be deprioritized.
 fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
-    [
-        pricing.input_cost_per_token,
-        pricing.output_cost_per_token,
-        pricing.cache_read_input_token_cost,
-        pricing.cache_creation_input_token_cost,
-        pricing.input_cost_per_token_above_128k_tokens,
-        pricing.input_cost_per_token_above_200k_tokens,
-        pricing.input_cost_per_token_above_256k_tokens,
-        pricing.input_cost_per_token_above_272k_tokens,
-        pricing.output_cost_per_token_above_128k_tokens,
-        pricing.output_cost_per_token_above_200k_tokens,
-        pricing.output_cost_per_token_above_256k_tokens,
-        pricing.output_cost_per_token_above_272k_tokens,
-        pricing.cache_read_input_token_cost_above_200k_tokens,
-        pricing.cache_read_input_token_cost_above_272k_tokens,
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
-    ]
-    .into_iter()
-    .any(|opt| opt.is_some_and(is_valid_price_value))
+    pricing
+        .all_rates()
+        .into_iter()
+        .any(|opt| opt.is_some_and(is_valid_price_value))
 }
 
 fn lookup_result_if_usable(
@@ -2358,6 +2393,55 @@ mod tests {
 
     fn create_lookup() -> PricingLookup {
         PricingLookup::new(mock_litellm(), mock_openrouter(), HashMap::new())
+    }
+
+    /// Regression (#831): router/proxy-assigned ids like `cx/gpt-5.5` (seen
+    /// from OpenCode's `omniroute` provider) carry a prefix outside the
+    /// curated `PROVIDER_PREFIXES` list, so the pricing lookup used to return
+    /// `None` (and thus bill $0) instead of stripping the prefix and pricing
+    /// the underlying `gpt-5.5` model.
+    #[test]
+    fn test_unknown_prefixed_model_id_strips_to_underlying_model() {
+        let lookup = create_lookup();
+        let direct = lookup.lookup("gpt-5.5").unwrap();
+        let prefixed = lookup.lookup("cx/gpt-5.5").unwrap();
+        assert_eq!(prefixed.matched_key, direct.matched_key);
+        assert_eq!(prefixed.source, direct.source);
+        assert_eq!(
+            prefixed.pricing.input_cost_per_token,
+            direct.pricing.input_cost_per_token
+        );
+        assert_eq!(
+            prefixed.pricing.output_cost_per_token,
+            direct.pricing.output_cost_per_token
+        );
+    }
+
+    /// Regression (#846): an id carrying both a routing prefix and a tier
+    /// suffix resolved to nothing, so real usage billed $0. Each id below
+    /// resolves once one transformation is applied, but the two were never
+    /// applied together: prefix stripping only retried the terminal segment
+    /// as-is, and suffix stripping splits on `-`, so it never shed the `cx/`.
+    #[test]
+    fn test_routing_prefix_and_tier_suffix_strip_together() {
+        let lookup = create_lookup();
+        let expected = lookup.lookup("gpt-5.5").unwrap();
+
+        for id in [
+            "cx/gpt-5.5-xhigh",
+            "cx/gpt-5.5-high",
+            "cx/gpt-5.5-medium",
+            "cx/gpt-5.5-low",
+        ] {
+            let result = lookup
+                .lookup(id)
+                .unwrap_or_else(|| panic!("{id} must resolve"));
+            assert_eq!(result.matched_key, expected.matched_key, "id: {id}");
+            assert_eq!(
+                result.pricing.input_cost_per_token, expected.pricing.input_cost_per_token,
+                "id: {id}"
+            );
+        }
     }
 
     // =========================================================================

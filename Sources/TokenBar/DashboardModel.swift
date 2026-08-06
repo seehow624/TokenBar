@@ -112,6 +112,15 @@ private struct DashboardSnapshot {
     /// rootView teardown/rebuild cycle.
     /// `--year=<yyyy>` preselects a year (debug/screenshot aid).
     private(set) var year: String? = DashboardModel.resolveYear()
+    /// Machine scope for the base lenses. nil = this machine only; a machine
+    /// name = that machine's mirror only; `.combined` = every machine summed.
+    private(set) var machineScope: String?
+    /// The combined view is the default when any enabled mirror exists.
+    var isCombinedScope: Bool { machineScope == MachineScope.combined }
+    enum MachineScope {
+        static let combined = "⌥combined"
+        static let local = "⌥local"
+    }
     /// Union of `payload.years` across loads — a year-filtered payload only
     /// reports the selected year, so remember the rest for the picker.
     private(set) var knownYears: [String] = []
@@ -123,6 +132,9 @@ private struct DashboardSnapshot {
     private(set) var agents: AgentsReport?
     private(set) var agentUsage: AgentUsagePayload?
     private(set) var trace: [TraceBucket] = []
+    /// Enabled remote mirrors, resolved at fetch time. Set whenever the scope
+    /// can include a remote machine (combined view or a specific machine).
+    @ObservationIgnored private var remoteMachines: [RemoteMachine]?
 
     // Memo for the hidden-client Overview slice: lensContent re-evals on every
     // ~10s trace poll, and re-aggregating UsageStats (incl. Streaks' full-range
@@ -167,16 +179,36 @@ private struct DashboardSnapshot {
     func load() async {
         do {
             let year = self.year
+            let scope = self.machineScope
+            let machines = RemoteMachineStore.shared.enabledMachines
+            remoteMachines = machines
             async let payloadTask = source.graph(year: year, priority: .userInitiated)
             async let reportTask = source.modelReport(year: year, priority: .userInitiated)
             let payload = try await payloadTask
             let report = try? await reportTask
+            // Remote payloads (only when the scope can include a mirror).
+            let remote: [String: UsagePayload]
+            let remoteReports: [String: ModelReport]
+            if !machines.isEmpty, scope == MachineScope.combined {
+                remote = await fetchRemotePayloads(year: year)
+                remoteReports = await fetchRemoteReports(year: year)
+            } else {
+                remote = [:]
+                remoteReports = [:]
+            }
             // The year may have changed while we were off-actor (the user can
             // open the year menu during the initial load); drop a stale slice
             // so apply() never tags the new year — and the static snapshot —
             // with the old year's payload. Mirrors reload()/pollGraph().
             guard self.year == year else { return }
-            apply(payload: payload, report: report)
+            if isCombinedScope, !remote.isEmpty {
+                apply(
+                    payload: RemoteUsage(local: payload, remote: remote).combined,
+                    report: RemoteUsage.mergeModelReports([report].compactMap { $0 } + remoteReports.values.map { $0 })
+                )
+            } else {
+                apply(payload: payload, report: report)
+            }
         } catch {
             // Keep showing stale data over an error screen when a previous
             // load succeeded — a transient failure must not blank the UI.
@@ -184,6 +216,39 @@ private struct DashboardSnapshot {
                 phase = .failed("Failed to load usage: \(error)")
             }
         }
+    }
+
+    /// Fetch the remote-machine payloads the current scope needs, keyed by
+    /// machine name. Only enabled machines with mirrored data are fetched;
+    /// a failed remote fetch is skipped (the local data still loads).
+    private func fetchRemotePayloads(year: String?) async -> [String: UsagePayload] {
+        guard let machines = remoteMachines, !machines.isEmpty else { return [:] }
+        var result: [String: UsagePayload] = [:]
+        for machine in machines {
+            let home = machine.mirrorHomePath
+            let payload: UsagePayload? = try? await Task.detached(priority: .utility) {
+                try TBCore.remoteGraph(year: year, home: home)
+            }.value
+            if let payload {
+                result[machine.name] = payload
+            }
+        }
+        return result
+    }
+
+    private func fetchRemoteReports(year: String?) async -> [String: ModelReport] {
+        guard let machines = remoteMachines, !machines.isEmpty else { return [:] }
+        var result: [String: ModelReport] = [:]
+        for machine in machines {
+            let home = machine.mirrorHomePath
+            let report: ModelReport? = try? await Task.detached(priority: .utility) {
+                try TBCore.remoteModelReport(year: year, home: home)
+            }.value
+            if let report {
+                result[machine.name] = report
+            }
+        }
+        return result
     }
 
     private(set) var refreshing = false
@@ -209,6 +274,17 @@ private struct DashboardSnapshot {
         await reload(force: false)
     }
 
+    /// Switch the machine scope (local / combined / a named remote mirror)
+    /// and re-fetch every lens for the new slice. The scope is not persisted:
+    /// a freshly configured mirror defaults to the combined view on next load.
+    func setMachineScope(_ scope: String?) async {
+        guard scope != machineScope, !refreshing else { return }
+        machineScope = scope
+        refreshing = true
+        defer { refreshing = false }
+        await reload(force: false)
+    }
+
     /// Auto-clear a year filter scoped to a year that only hidden clients used.
     /// The best-effort year picker can't drop such a year while it is the active
     /// selection (the payload is year-scoped then), so a dashboard already
@@ -228,13 +304,29 @@ private struct DashboardSnapshot {
 
     private func reload(force: Bool) async {
         let year = self.year
+        let machines = RemoteMachineStore.shared.enabledMachines
+        remoteMachines = machines
         async let payloadTask = force
             ? source.refreshGraph(year: year, priority: .userInitiated)
             : source.graph(year: year, priority: .userInitiated)
         async let reportTask = source.modelReport(year: year, priority: .userInitiated)
         guard let payload = try? await payloadTask else { return }
         let report = try? await reportTask
-        apply(payload: payload, report: report)
+        if isCombinedScope, !machines.isEmpty {
+            let remote = await fetchRemotePayloads(year: year)
+            let remoteReports = await fetchRemoteReports(year: year)
+            if !remote.isEmpty {
+                apply(
+                    payload: RemoteUsage(local: payload, remote: remote).combined,
+                    report: RemoteUsage.mergeModelReports(
+                        [report].compactMap { $0 } + remoteReports.values.map { $0 })
+                )
+            } else {
+                apply(payload: payload, report: report)
+            }
+        } else {
+            apply(payload: payload, report: report)
+        }
         // If apply() cleared a now-empty year filter, it spawned its own
         // unfiltered reload that re-fetches the lazy lenses for the new (nil)
         // year — skip the stale-`year` re-fetch here, or an empty year-filtered

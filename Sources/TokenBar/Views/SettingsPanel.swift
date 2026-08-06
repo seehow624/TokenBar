@@ -303,6 +303,12 @@ struct SettingsPanel: View {
                 hint("Affects the live-session card only: on, each agent & model gets its own row; off, rows collapse to one per app.")
             }
 
+            if RemoteMachineStore.isFeatureAvailable {
+                section("Remote machines") {
+                    RemoteMachinesSection()
+                }
+            }
+
             section("Popover size") {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {

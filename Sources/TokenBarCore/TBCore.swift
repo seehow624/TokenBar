@@ -113,6 +113,32 @@ public enum TBCore {
         }
     }
 
+    /// Pass an optional year filter and a required remote mirror home across
+    /// the boundary. The home is never NULL/empty — the FFI rejects it, because
+    /// a missing home would silently fall back to scanning this machine.
+    private static func withYearAndHome<R>(
+        _ year: String?, _ home: String,
+        _ body: (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> R
+    ) -> R {
+        withYear(year) { yearPtr in
+            home.withCString { body(yearPtr, $0) }
+        }
+    }
+
+    /// `withYearAndClients` plus the required remote mirror home.
+    private static func withYearClientsAndHome<R>(
+        _ year: String?, _ clients: [String]?, _ home: String,
+        _ body: (UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> R
+    ) -> R {
+        let joined = (clients?.isEmpty ?? true) ? nil : clients!.joined(separator: ",")
+        return withYear(year) { yearPtr in
+            guard let joined else { return home.withCString { body(yearPtr, nil, $0) } }
+            return joined.withCString { joinedPtr in
+                home.withCString { body(yearPtr, joinedPtr, $0) }
+            }
+        }
+    }
+
     public static func probe() throws -> ProbeResult {
         let result: ProbeResult = try decode(tb_probe())
         if !result.ok { throw TBCoreError.bridge(result.err ?? "unknown") }
@@ -128,6 +154,33 @@ public enum TBCore {
     /// Contribution graph, always recomputed.
     public static func refreshGraph(year: String? = nil) throws -> UsagePayload {
         try unwrap(withYear(year) { tb_refresh_graph($0) })
+    }
+
+    /// Contribution graph for a remote-machine mirror home (`year` nil = all
+    /// time). Scans only the mirror layout under `home` (a fake home holding
+    /// rsynced `.claude`/`.codex`/`.hermes`/`.local/share/opencode` trees) with
+    /// env roots disabled; always recomputes (the mirror updates at most hourly).
+    public static func remoteGraph(year: String? = nil, home: String) throws -> UsagePayload {
+        try unwrap(withYearAndHome(year, home) { tb_graph_remote($0, $1) })
+    }
+
+    /// Per-model report for a remote-machine mirror home. See `remoteGraph`.
+    public static func remoteModelReport(year: String? = nil, home: String) throws -> ModelReport {
+        try unwrap(withYearAndHome(year, home) { tb_model_report_remote($0, $1) })
+    }
+
+    /// Per-hour report for a remote-machine mirror home. See `remoteGraph`.
+    public static func remoteHourlyReport(
+        year: String? = nil, clients: [String]? = nil, home: String
+    ) throws -> HourlyReport {
+        try unwrap(withYearClientsAndHome(year, clients, home) { tb_hourly_report_remote($0, $1, $2) })
+    }
+
+    /// Per-agent report for a remote-machine mirror home. See `remoteGraph`.
+    public static func remoteAgentsReport(
+        year: String? = nil, clients: [String]? = nil, home: String
+    ) throws -> AgentsReport {
+        try unwrap(withYearClientsAndHome(year, clients, home) { tb_agents_report_remote($0, $1, $2) })
     }
 
     public static func modelReport(year: String? = nil) throws -> ModelReport {
