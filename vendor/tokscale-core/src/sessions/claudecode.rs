@@ -544,6 +544,7 @@ pub fn parse_claude_file_with_cache_and_home(
                         workspace_label: workspace_label.clone(),
                         sidechain_agent: sidechain_agent.clone(),
                         suppress_unattributed: suppress_unattributed_tool_results,
+                        allow_char_estimate: false,
                     },
                 );
 
@@ -938,6 +939,11 @@ struct ClaudeToolResultContext<'a> {
     /// A preceding local Claude Code notice used `<synthetic>` instead of an API
     /// model. A following tool result with no model cannot be attributed safely.
     suppress_unattributed: bool,
+    /// Whether char-based token estimation may be used as a fallback when no
+    /// explicit tool-result token count is present. Nothing sets it true: the
+    /// next assistant turn's usage already covers the same text, so an
+    /// estimate counts it twice. The flag stays to match upstream's shape.
+    allow_char_estimate: bool,
 }
 
 fn extract_claude_tool_result_message(
@@ -945,7 +951,7 @@ fn extract_claude_tool_result_message(
     context: ClaudeToolResultContext<'_>,
 ) -> Option<UnifiedMessage> {
     let value: Value = serde_json::from_str(line).ok()?;
-    let usage = extract_claude_tool_result_usage(&value)?;
+    let usage = extract_claude_tool_result_usage(&value, context.allow_char_estimate)?;
 
     let explicit_model = extract_claude_model(&value).or_else(|| {
         context
@@ -1012,7 +1018,10 @@ fn extract_claude_tool_result_message(
     Some(message)
 }
 
-fn extract_claude_tool_result_usage(value: &Value) -> Option<ClaudeToolResultUsage> {
+fn extract_claude_tool_result_usage(
+    value: &Value,
+    allow_char_estimate: bool,
+) -> Option<ClaudeToolResultUsage> {
     let mut total_tokens = 0;
     let mut first_dedup_id: Option<String> = None;
     let mut seen_ids = HashSet::new();
@@ -1027,7 +1036,8 @@ fn extract_claude_tool_result_usage(value: &Value) -> Option<ClaudeToolResultUsa
         if first_dedup_id.is_none() {
             first_dedup_id = tool_result_id;
         }
-        total_tokens += extract_tool_result_input_tokens(tool_result).unwrap_or(0);
+        total_tokens +=
+            extract_tool_result_input_tokens(tool_result, allow_char_estimate).unwrap_or(0);
     }
 
     if total_tokens <= 0 {
@@ -1093,8 +1103,11 @@ fn extract_tool_result_id(tool_result: &Value) -> Option<String> {
         .or_else(|| extract_string(tool_result.get("tool_result_id")))
 }
 
-fn extract_tool_result_input_tokens(tool_result: &Value) -> Option<i64> {
+fn extract_tool_result_input_tokens(tool_result: &Value, allow_char_estimate: bool) -> Option<i64> {
     explicit_tool_result_input_tokens(tool_result).or_else(|| {
+        if !allow_char_estimate {
+            return None;
+        }
         let chars = tool_result_output_char_count(tool_result);
         (chars > 0).then(|| estimate_tokens_from_chars(chars))
     })
@@ -2061,8 +2074,8 @@ mod tests {
 
         assert_eq!(
             messages.len(),
-            4,
-            "Should include 3 assistant messages plus 1 tool-result input message"
+            3,
+            "Should include 3 assistant messages; the tool_result carries no explicit tokens"
         );
         let assistant_messages: Vec<_> = messages
             .iter()
@@ -2149,28 +2162,16 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_output_counts_as_input() {
+    fn test_tool_result_without_explicit_tokens_is_not_counted() {
         let content = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"anthropic/claude-4-6-sonnet","content":[{"type":"tool_result","tool_use_id":"toolu_input","tool_output":{"output":"abcdefghijklmnop"}}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
-        assert_eq!(messages[0].provider_id, "anthropic");
-        assert_eq!(messages[0].tokens.input, 4);
-        assert_eq!(messages[0].tokens.output, 0);
-        assert_eq!(messages[0].tokens.cache_read, 0);
-        assert_eq!(messages[0].tokens.cache_write, 0);
-        let expected_dedup_key = format!(
-            "claude:tool_result:{}:tool_result:toolu_input",
-            messages[0].session_id
+        assert!(
+            messages.is_empty(),
+            "the next assistant turn's usage already covers this text"
         );
-        assert_eq!(
-            messages[0].dedup_key.as_deref(),
-            Some(expected_dedup_key.as_str())
-        );
-        assert_eq!(messages[0].message_count, 0);
     }
 
     #[test]
@@ -2196,21 +2197,22 @@ mod tests {
 
     #[test]
     fn test_tool_result_duplicate_uses_max_input_tokens() {
-        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnop"}}}
-{"type":"tool_result","timestamp":"2026-05-27T10:00:00.100Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd"}}}"#;
+        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}}}
+{"type":"tool_result","timestamp":"2026-05-27T10:00:00.100Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd","input_tokens":8}}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].provider_id, "anthropic");
         assert_eq!(messages[0].tokens.input, 8);
         assert_eq!(messages[0].timestamp, 1_779_876_000_100);
     }
 
     #[test]
     fn test_tool_result_repeated_in_same_record_is_not_counted_twice() {
-        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop"}},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop"}}]}}"#;
+        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
@@ -2220,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_prefers_input_token_metadata_over_char_estimate() {
+    fn test_tool_result_with_explicit_token_metadata_is_counted() {
         let content = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"claude-sonnet-4-6","content":[{"type":"tool_result","tool_use_id":"toolu_metadata","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd","input_tokens":3}}]}}"#;
 
         let file = create_test_file(content);
@@ -2228,6 +2230,16 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 3);
+        assert_eq!(messages[0].tokens.output, 0);
+        let expected_dedup_key = format!(
+            "claude:tool_result:{}:tool_result:toolu_metadata",
+            messages[0].session_id
+        );
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some(expected_dedup_key.as_str())
+        );
+        assert_eq!(messages[0].message_count, 0);
     }
 
     #[test]
@@ -2301,7 +2313,7 @@ mod tests {
     #[test]
     fn test_synthetic_notice_does_not_hide_an_explicitly_modelled_tool_result() {
         let content = r#"{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","message":{"model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}
-{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","message":{"model":"claude-sonnet-4-6","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"XXXXXXXXXXXXXXXX"}]}}"#;
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","message":{"model":"claude-sonnet-4-6","content":[{"tool_use_id":"toolu_1","type":"tool_result","input_tokens":4,"content":"XXXXXXXXXXXXXXXX"}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
@@ -2515,6 +2527,76 @@ mod tests {
             messages.is_empty(),
             "wrapper transcripts without usage metadata must not be estimated"
         );
+    }
+
+    #[test]
+    fn test_bare_transcript_with_tool_outputs_is_not_estimated() {
+        let content = r#"{"type":"tool_use","timestamp":"2026-04-01T10:00:00.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}
+{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"},"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}
+{"type":"tool_use","timestamp":"2026-04-01T10:00:02.000Z","tool_name":"bash","tool_input":{"command":"cargo build"}}
+{"type":"tool_result","timestamp":"2026-04-01T10:00:03.000Z","tool_name":"bash","tool_input":{"command":"cargo build"},"tool_output":{"output":"   Compiling myproject v0.1.0\n    Finished dev [unoptimized + debuginfo] target(s) in 2.34s\n"}}"#;
+        let (_dir, path) = create_transcript_file(content, "ses_aabbccdd11223344556677889.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert!(
+            messages.is_empty(),
+            "bare transcripts with only tool outputs must not produce estimated token messages"
+        );
+    }
+
+    #[test]
+    fn test_project_transcript_with_tool_outputs_is_not_estimated() {
+        let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":[{"type":"text","text":"fn main() { println!(\"hello\"); }"}]}]}}"#;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject")
+            .join("ses_project123.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+
+        let messages = parse_claude_file(&path);
+
+        assert!(
+            messages.is_empty(),
+            "the assistant turn that follows already bills this content"
+        );
+    }
+
+    #[test]
+    fn test_reported_input_is_not_inflated_by_tool_result_text() {
+        // A real transcript's shape: no metadata on the tool result, and the
+        // next turn reporting that text under cache_creation_input_tokens.
+        let content = r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":"fn main() { println!(\"hello\"); }"}]}}
+{"type":"assistant","timestamp":"2026-04-01T10:00:01.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"cache_creation_input_tokens":1551,"cache_read_input_tokens":88518,"output_tokens":367}}}"#;
+        let (_dir, path) = create_project_file(content, "myproject", "ses_inflation1122.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 2);
+        assert_eq!(messages[0].tokens.cache_write, 1551);
+        assert_eq!(messages[0].tokens.cache_read, 88518);
+        assert_eq!(messages[0].tokens.output, 367);
+    }
+
+    #[test]
+    fn test_bare_transcript_with_explicit_tool_result_tokens_is_counted() {
+        // Nothing is char-estimated, but an explicit count is still honored.
+        let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","input_tokens":42,"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
+        let (_dir, path) = create_transcript_file(content, "ses_explicit112233445566778899.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "bare transcripts must still count explicit tool-result token usage"
+        );
+        assert_eq!(messages[0].tokens.input, 42);
     }
 
     // --- Sidechain / Agent tracking tests ---

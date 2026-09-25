@@ -179,6 +179,19 @@ pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
         return Some("qwen");
     }
 
+    // Kimi (Moonshot AI) — `kimi`, `kimi-k2.5`, `kimi-code` variants
+    if contains_delimited(&lower, "kimi") {
+        return Some("moonshotai");
+    }
+    // MiMo (Xiaomi) — `mimo-v2.5` etc.
+    if contains_delimited(&lower, "mimo") {
+        return Some("xiaomi");
+    }
+    // GLM (Zhipu AI / Zai) — `glm-4.6`, `glm-5.2` etc.
+    if contains_delimited(&lower, "glm") {
+        return Some("zai");
+    }
+
     None
 }
 
@@ -308,6 +321,27 @@ mod tests {
             inferred_provider_from_model("ollama/llama-3.3"),
             Some("meta")
         );
+    }
+
+    #[test]
+    fn test_inferred_provider_normalizes_kimi_mimo_and_glm() {
+        assert_eq!(
+            inferred_provider_from_model("kimi-k2.5"),
+            Some("moonshotai")
+        );
+        assert_eq!(
+            inferred_provider_from_model("moonshotai/kimi-code"),
+            Some("moonshotai")
+        );
+        assert_eq!(inferred_provider_from_model("mimo-v2.5"), Some("xiaomi"));
+        assert_eq!(inferred_provider_from_model("glm-4.6"), Some("zai"));
+    }
+
+    #[test]
+    fn test_inferred_provider_delimiters_avoid_kimi_mimo_glm_false_positives() {
+        assert_eq!(inferred_provider_from_model("kimiko"), None);
+        assert_eq!(inferred_provider_from_model("mimosa"), None);
+        assert_eq!(inferred_provider_from_model("aglm"), None);
     }
 
     #[test]

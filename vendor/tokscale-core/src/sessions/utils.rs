@@ -73,6 +73,15 @@ pub(crate) fn parse_timestamp_str(value: &str) -> Option<i64> {
     None
 }
 
+/// Back-calculate a start anchor from a recorded end timestamp and elapsed
+/// duration: `end - duration`. Non-positive candidates fall back to `end` so
+/// sessionization does not silently discard corrupt or clock-skewed rows.
+pub(crate) fn back_anchor_timestamp(end: i64, duration: i64) -> i64 {
+    end.checked_sub(duration)
+        .filter(|candidate| *candidate > 0)
+        .unwrap_or(end)
+}
+
 pub(crate) fn file_modified_timestamp_ms(path: &Path) -> i64 {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())

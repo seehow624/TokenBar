@@ -36,7 +36,7 @@ TokenBar native 已完成從 Tauri 到 SwiftUI 的出貨重寫，現在是維護
 | Area | Current evidence |
 |---|---|
 | Product | Native SwiftUI menu-bar app is the shipping line; the predecessor Tauri repository is archived and remains a legacy migration source |
-| Vendor | Current main tree includes selective tokscale alignment through the M15 batch (start-anchored durations, OpenCode v2 schema, Hermes per-model attribution); local cache schema is 31 |
+| Vendor | Current main tree includes selective tokscale alignment through the M16 batch (Claude tool-result estimation removed, Copilot span/timestamp correctness, Jcode start-anchored durations, Antigravity aliases, Kimi/MiMo/GLM provider inference, deterministic pricing fallback ties) plus the M18 LiteLLM whole-request long-context rule; local cache schema is 32 |
 | Correctness | Cost provenance, Jcode correction turns, Pi metadata, Claude workflow transcripts, Copilot hierarchy, hidden-client filtering, and bounded folds have landed in staged releases or main history |
 | Release | Stable Sparkle feed, Homebrew cask, legacy update metadata, and landing Pages workflows are maintained as separate delivery surfaces |
 | Current repository baseline | Before each task, fetch and resolve the current `origin/main`; this document is not a commit pin |
@@ -58,7 +58,7 @@ Setup-token quota fallback is shipped: when profile usage is unavailable, provid
 | Workstream | Status | Public surface |
 |---|---|---|
 | Copilot upstream follow-up | Assessment complete: merged PR #880 is equivalent to the local M10-E trace-scoped hierarchy and cache invalidation; no additional code or schema port is needed | [issue #879](https://github.com/junhoyeo/tokscale/issues/879), [PR #880](https://github.com/junhoyeo/tokscale/pull/880) |
-| Rolling tokscale alignment | The current correctness batch is integrated through M14; the inventory remains active and future work stays selective, not wholesale | [issue #45](https://github.com/Nanako0129/TokenBar/issues/45), [`plans/tokscale-alignment.md`](plans/tokscale-alignment.md) |
+| Rolling tokscale alignment | The current correctness batch is integrated through M16; the inventory remains active and future work stays selective, not wholesale | [issue #45](https://github.com/Nanako0129/TokenBar/issues/45), [`plans/tokscale-alignment.md`](plans/tokscale-alignment.md), [`plans/engine-sync-candidates.md`](plans/engine-sync-candidates.md) |
 | Day-bar empty-today behavior | Parked, because changing the right edge changes the visible chart and needs a focused fixture plus UI verification | No public commitment beyond the maintenance note |
 | Liquid Glass parity | Parked; current glass recipe remains the shipped status quo | [`history/liquid-glass-experiments.md`](history/liquid-glass-experiments.md) |
 

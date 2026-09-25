@@ -74,7 +74,7 @@ use std::time::UNIX_EPOCH;
 // keys instead of crediting the whole session to one model (#961). Schema-30
 // caches can replay a v1-only, id-collapsed OpenCode parse or a single-model
 // Hermes parse for an unchanged database and must be rebuilt.)
-const CACHE_SCHEMA_VERSION: u32 = 31;
+const CACHE_SCHEMA_VERSION: u32 = 32;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -2655,5 +2655,76 @@ mod tests {
         let cached_path = CachedPath::from_path(&path);
 
         assert_eq!(cached_path.to_path_buf(), path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_31_jcode_cache_is_stale_and_rebuilt_with_start_anchored_timestamp() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source = write_temp_file(
+                br#"{
+  "id":"session_schema31",
+  "model":"snapshot-model",
+  "messages":[
+    {"id":"assistant_1","role":"assistant","timestamp":"2026-06-16T12:00:05Z","token_usage":{"input_tokens":100,"output_tokens":10},"tool_duration_ms":2000}
+  ]
+}"#,
+            );
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let start_anchor = crate::sessions::utils::parse_timestamp_str("2026-06-16T12:00:03Z")
+                .unwrap();
+            let end_anchor = crate::sessions::utils::parse_timestamp_str("2026-06-16T12:00:05Z")
+                .unwrap();
+
+            let parsed = crate::sessions::jcode::parse_jcode_file(source.path());
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].timestamp, start_anchor);
+
+            // The schema-31 entry holds the completion-anchored timestamp the
+            // old parser produced (the recorded end, not the turn start) under
+            // the same source fingerprint, so only the schema counter can
+            // reject it.
+            let mut stale_messages = parsed.clone();
+            stale_messages[0].set_timestamp(end_anchor);
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                stale_messages,
+                Vec::new(),
+                None,
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 31,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(
+                loaded.entries.is_empty(),
+                "schema-31 jcode completion anchors must be stale"
+            );
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale entry and rebuilt parse have the same source fingerprint"
+            );
+            assert_eq!(
+                crate::sessions::jcode::parse_jcode_file(source.path())[0].timestamp,
+                start_anchor,
+                "the rebuilt parse is start-anchored"
+            );
+        }
+
+        restore_cache_env(prev_env);
     }
 }

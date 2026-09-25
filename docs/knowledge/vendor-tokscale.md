@@ -70,7 +70,7 @@ flowchart TD
 
 ## Schema and parser output
 
-The vendor owns its cache-schema counter. It is currently schema 31 after the M15 batch (start-anchored Claude/Codex timestamps, OpenCode v2 `session_message` parsing with distinct-id separation, and Hermes per-model `session_model_usage` attribution). Do not mirror an upstream schema number merely because the same upstream commit is being ported. Bump the local schema when serialized message fields, parser output, dedup keys, attribution, or parser-resume state changes make old cached values semantically stale; do not bump for report-time-only arithmetic changes.
+The vendor owns its cache-schema counter. It is currently schema 32 after the M16 batch (Claude tool-result char estimation removed, Copilot repeated-span merge and start-anchored timestamps, Jcode start-anchored durations, Antigravity model aliases, Kimi/MiMo/GLM provider inference). The M15 batch set schema 31 (start-anchored Claude/Codex timestamps, OpenCode v2 `session_message` parsing with distinct-id separation, and Hermes per-model `session_model_usage` attribution). Do not mirror an upstream schema number merely because the same upstream commit is being ported. Bump the local schema when serialized message fields, parser output, dedup keys, attribution, or parser-resume state changes make old cached values semantically stale; do not bump for report-time-only arithmetic changes.
 
 A parser-output change must include a same-fingerprint stale-cache regression. A test that only parses a fresh source does not prove that existing users receive the correction.
 

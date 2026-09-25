@@ -24,6 +24,8 @@ TokenBar follows upstream `tokscale` as a rolling source and selects correctness
 | New client breadth | deferred | Requires an explicit product decision and a complete streaming/cache/FFI adaptation |
 | Pricing pipeline expansion | deferred | Do not port a partial routed-pricing behavior without a complete precedence and safety model |
 
+> **Next sync inventory:** the unported engine delta against the reviewed upstream pin, with each item's verified local state and classification, lives in [`engine-sync-candidates.md`](engine-sync-candidates.md). It is a decision surface, not an authorization.
+
 ## Milestone protocol
 
 ```mermaid

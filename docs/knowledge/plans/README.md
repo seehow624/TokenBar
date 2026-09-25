@@ -17,5 +17,6 @@ sources: ["docs/knowledge/current-state.md", "docs/knowledge/vendor-tokscale.md"
 | Plan | Status | Scope |
 |---|---|---|
 | [`tokscale-alignment.md`](tokscale-alignment.md) | active | Rolling selective alignment and correctness order |
+| [`engine-sync-candidates.md`](engine-sync-candidates.md) | active | Unported engine delta vs the reviewed upstream pin, classified by value and risk |
 
 Historical or superseded private plans remain classified in [`../migration-ledger.md`](../migration-ledger.md); they are not copied wholesale into the public tree.

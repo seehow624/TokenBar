@@ -76,6 +76,18 @@ const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
 const TIERED_PRICING_THRESHOLD_256K_TOKENS: f64 = 256_000.0;
 const TIERED_PRICING_THRESHOLD_272K_TOKENS: f64 = 272_000.0;
 
+// Only these identities document one long-context rate tier for the whole
+// request. Other catalog `*_above_*` fields retain marginal semantics (each
+// field walks its own thresholds).
+const FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-2026-03-05",
+    "gpt-5.4-pro",
+    "gpt-5.4-pro-2026-03-05",
+    "gpt-5.5",
+    "gpt-5.5-2026-04-23",
+];
+
 const MIN_FUZZY_MATCH_LEN: usize = 5;
 
 /// Minimum length for a model name candidate after prefix/suffix stripping.
@@ -135,10 +147,14 @@ impl PricingLookup {
         cursor: HashMap<String, ModelPricing>,
     ) -> Self {
         let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
-        litellm_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        // Length first (longest key wins), then lexicographic. The secondary
+        // order makes equal-length fallback ties reproducible: without it a
+        // rebuilt catalog could keep HashMap iteration order and reprice
+        // identical historical usage with a different dated rate.
+        litellm_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut openrouter_keys: Vec<String> = openrouter.keys().cloned().collect();
-        openrouter_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        openrouter_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut litellm_lower = HashMap::with_capacity(litellm.len());
         for key in &litellm_keys {
@@ -284,6 +300,14 @@ impl PricingLookup {
         }
 
         let lower_ref: &str = normalized_owned.as_deref().unwrap_or(&lower);
+
+        // Normalize the forced-source selector once, so LiteLLM/OpenRouter
+        // isolation is case-insensitive through the direct, exact, and
+        // fallback paths (`"LiteLLM"` used to fall through to automatic
+        // lookup). The `custom` selector is resolved by `PricingService`
+        // before this function runs.
+        let force_source_normalized = force_source.map(str::to_ascii_lowercase);
+        let force_source = force_source_normalized.as_deref();
 
         // Helper to perform lookup with the given source constraint
         let do_lookup = |id: &str| match force_source {
@@ -886,6 +910,17 @@ impl PricingLookup {
             None => return 0.0,
         };
 
+        if uses_full_session_long_context_tier(&result) {
+            return compute_full_session_long_context_cost(
+                &result.pricing,
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.reasoning,
+            );
+        }
+
         compute_cost(
             &result.pricing,
             usage.input,
@@ -895,6 +930,76 @@ impl PricingLookup {
             usage.reasoning,
         )
     }
+}
+
+/// Whether this lookup result prices the request as one long-context tier.
+///
+/// Upstream `#846`/M18: a handful of LiteLLM identities document a single
+/// above-272k rate that applies to the *whole request* once
+/// `input + cache_read` crosses the threshold, rather than per field. Sakana's
+/// own catalog dimension is not vendored here, so only the LiteLLM identities
+/// gate this path.
+fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
+    let terminal_model_id = result
+        .matched_key
+        .rsplit('/')
+        .next()
+        .unwrap_or(result.matched_key.as_str());
+    result.source.eq_ignore_ascii_case("LiteLLM")
+        && FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
+            .iter()
+            .any(|key| terminal_model_id.eq_ignore_ascii_case(key))
+}
+
+/// Whole-request long-context pricing: the 272k tier is selected once for the
+/// request (by `input + cache_read`) and then applied to input, output, and
+/// cache-read alike. Cache-write is an independently reported subset and does
+/// not select the tier, matching the provider's documented behavior.
+fn compute_full_session_long_context_cost(
+    pricing: &ModelPricing,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+) -> f64 {
+    let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
+    let input_clamped = input.max(0) as f64;
+    let output_clamped = output.max(0).saturating_add(reasoning.max(0)) as f64;
+    let cache_read_clamped = cache_read.max(0) as f64;
+    let use_long_context_rates =
+        input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
+    let selected_price = |base: Option<f64>, long_context: Option<f64>| {
+        if use_long_context_rates {
+            safe_price(
+                long_context
+                    .filter(|value| is_valid_price_value(*value))
+                    .or(base),
+            )
+        } else {
+            safe_price(base)
+        }
+    };
+
+    let input_cost = input_clamped
+        * selected_price(
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_272k_tokens,
+        );
+    let output_cost = output_clamped
+        * selected_price(
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_272k_tokens,
+        );
+    let cache_read_cost = cache_read_clamped
+        * selected_price(
+            pricing.cache_read_input_token_cost,
+            pricing.cache_read_input_token_cost_above_272k_tokens,
+        );
+
+    let cache_write_cost = compute_cost(pricing, 0, 0, 0, cache_write, 0);
+
+    input_cost + output_cost + cache_read_cost + cache_write_cost
 }
 
 pub fn compute_cost(
@@ -1933,6 +2038,104 @@ mod tests {
             source: source.into(),
             matched_key: matched.into(),
         }
+    }
+
+    #[test]
+    fn test_gpt_5_5_uses_full_request_long_context_rates() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 270_540, 630, 7_936, 0, 0);
+        let expected = 270_540.0 * 0.000010 + 630.0 * 0.000045 + 7_936.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_provider_prefixed_gpt_5_5_uses_full_request_long_context_rates() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000001),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 271_999,
+            output: 3,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: 4,
+        };
+
+        let cost = lookup.calculate_cost_with_provider("openai/gpt-5.5", Some("openai"), &usage);
+        let expected = 271_999.0 * 0.000010 + 7.0 * 0.000045 + 2.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_threshold_includes_cache_read_and_reasoning() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 271_999, 3, 2, 0, 4);
+        let expected = 271_999.0 * 0.000010 + 7.0 * 0.000045 + 2.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_exact_threshold_stays_regular() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 272_000, 3, 0, 0, 4);
+        let expected = 272_000.0 * 0.000005 + 7.0 * 0.000030;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_cache_write_does_not_select_long_context() {
+        let lookup = create_lookup();
+        let without_cache_write = lookup.calculate_cost("gpt-5.5", 271_999, 10, 0, 0, 0);
+        let with_cache_write = lookup.calculate_cost("gpt-5.5", 271_999, 10, 0, 10_000, 0);
+        assert!((with_cache_write - without_cache_write).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_full_request_long_context_policy_is_identity_scoped() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(0.000005),
+            input_cost_per_token_above_272k_tokens: Some(0.000010),
+            ..Default::default()
+        };
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        // A provider-prefixed catalog key still matches on its terminal segment.
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "openai/gpt-5.5",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        // Other identities keep marginal tier semantics.
+        assert!(!uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.1",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        assert!(!uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5",
+            "OpenRouter",
+            pricing.clone()
+        )));
+        // An unlisted dated sibling is not covered.
+        assert!(!uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5-2026-01-01",
+            "LiteLLM",
+            pricing
+        )));
     }
 
     // A provider-matched OpenRouter row that omits cache rates must not bill
