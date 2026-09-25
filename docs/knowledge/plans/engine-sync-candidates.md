@@ -105,6 +105,21 @@ sources: ["vendor/README.md", "docs/knowledge/decisions/0003-selective-upstream-
 | 邊界 | 若動到 report options 或 payload，同步檢查 C ABI 與 Swift decoder |
 | 授權 | 本文件不授權 push、merge、tag 或 release |
 
+## RET-CLAUDE-001 設計要點（2026-09-25 偵察）
+
+要把它做成一個可驗證的里程碑，最少要動這六個點（上游是在 shard cache + per-client parser version 上做，我們是 monolithic schema，不能照搬）：
+
+| # | 點 | 現況 | 要做什麼 |
+|---|---|---|---|
+| 1 | `message_cache::CachedSourceEntry` | 無 retained 欄位 | 加 `retained_keys`（bincode positional，舊 payload 一律由 schema bump 拒收）、`with_retained_keys()`、`retainable_history(path)`；`CACHE_SCHEMA_VERSION` 32→33 |
+| 2 | `lib.rs` 泛用 loader | `CachedParseOutcome { messages, cache_entry, invalidate_cache }` | 加 `HistoryRetention`（`None` / `RetainObserved { key_is_globally_stable }`）與 `retained_keys`；約 12 個呼叫點傳 `None`，只有 Claude 傳 policy |
+| 3 | `sessions/claudecode` | 無 refresh 助手 | 加 `retained_key_is_globally_stable`（跳過空 key 與 `:tool_result:` 類 key，它們是重建出來的估值）與 `refresh_retained_message_context`（用 `claude_workspace_from_path` / `cc_mirror_variant_metadata_from_path` / `claude_provider_choice_from_parts` 重建 client/provider/workspace；agent 只在有 live sibling 時覆寫——上游還會讀 meta sidecar，我們沒有那個助手，要先補或明確接受保留快取值） |
+| 4 | **streaming Claude lane**（`lib.rs` 2415 附近） | 只讀 cache、**不寫 entry**（只有 `simple_lane!` 的檔會寫） | 這是關鍵：不寫 entry 就沒有「上一次的 messages」可保，retention 永遠不會觸發。lane 要在 miss 時寫入 entry（含 `retained_keys`），並把 retained 訊息延到該 lane 最後再 emit（live 先佔 key） |
+| 5 | count 路徑（`parse_local_clients`，`lib.rs` 3448 附近） | 直接 `parse_claude_file_with_cache_and_home`，完全不經 cache | 上游就是把它改成走同一條 retention-aware 路徑；否則 report 有 retained、count 沒有，會出現兩套數字 |
+| 6 | 回歸測試 | — | 適配上遊那組：compaction 後 turn 仍在、live 複本勝過 retained、同 fingerprint 的 retained 重建、sidechain agent 存活、count 與 report 一致 |
+
+> **為什麼不急著做：** 這六點横跨 cache、loader、streaming lane、count 四層，任何一處沒對齊就會在**最大成本項目（Claude）**上靜默多算或少算；上游自己的 ledger 為此寫了十幾段失敗模式。現有快照（M16/M18 引擎同步與 remote-machine 修復）在沒有它的情況下是自洽的，拿它必須是一個帶 schema bump 的獨立里程碑。
+
 ## 證據
 
 | 主張 | 證據入口 |
@@ -112,5 +127,6 @@ sources: ["vendor/README.md", "docs/knowledge/decisions/0003-selective-upstream-
 | 上游批次、commit 與分類 | `tokscale-core` `UPSTREAM.md` @ `d6512f5`（本文件 sources 的 URL） |
 | pin 之後只有 chore/docs | engine repo `d6512f5..main` 的 16 個 commit 標題 |
 | 我們已落地的批次與 local patches | [`vendor/README.md`](../../../vendor/README.md) |
-| 我們的 cache 形狀（monolithic schema 31） | `vendor/tokscale-core/src/message_cache.rs` |
+| 我們的 cache 形狀（monolithic，M16 後 schema 32） | `vendor/tokscale-core/src/message_cache.rs` |
 | 各項 marker 的存在性 | 本文件各列的「我們的現況」欄（grep 級證據；下手前仍需 hunk-level diff） |
+| 本地資料有無（2026-09-24 掃描） | 本文件 D 區的區塊引述指令 |
