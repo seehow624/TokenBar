@@ -16,14 +16,25 @@ public struct RemoteMachine: Codable, Identifiable, Sendable, Equatable {
     public var isEnabled: Bool
     /// Unix timestamp (seconds) of the last successful sync.
     public var lastSyncedAt: UInt64?
+    /// Unix timestamp (seconds) of the last sync where at least one mirrored
+    /// root landed but another failed. Cleared by a fully clean sync, so the
+    /// pair reads as "fully synced" / "partially synced" / "never synced".
+    public var lastPartialSyncedAt: UInt64?
 
     public var id: String { name }
 
-    public init(name: String, sshDestination: String, isEnabled: Bool = true, lastSyncedAt: UInt64? = nil) {
+    public init(
+        name: String,
+        sshDestination: String,
+        isEnabled: Bool = true,
+        lastSyncedAt: UInt64? = nil,
+        lastPartialSyncedAt: UInt64? = nil
+    ) {
         self.name = name
         self.sshDestination = sshDestination
         self.isEnabled = isEnabled
         self.lastSyncedAt = lastSyncedAt
+        self.lastPartialSyncedAt = lastPartialSyncedAt
     }
 
     /// Absolute path to this machine's mirror home

@@ -5,6 +5,12 @@ import TokenBarCore
 /// one-line summary each. Kept behind `--smoke` so CI can validate the
 /// bridge without booting the menu-bar app.
 enum Smoke {
+    /// Failure for a check that has no throwing API of its own.
+    struct SmokeFailure: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+
     /// Runs every check and returns the process exit code (0 = all green).
     /// Per-provider quota errors inside `agentUsage` print as card errors and
     /// do not fail the run; only thrown errors count as failures.
@@ -76,7 +82,10 @@ enum Smoke {
                     .appendingPathComponent("Preferences/\(name).plist")
                 guard let plist = try? Data(contentsOf: url),
                       let dict = try? PropertyListSerialization.propertyList(from: plist, format: nil) as? [String: Any],
-                      let data = dict["remoteMachines"] as? Data
+                      // The store persists under the namespaced key; the bare
+                      // name silently matched nothing and skipped this whole
+                      // remote block.
+                      let data = dict["tokenbar.remoteMachines"] as? Data
                 else { continue }
                 do {
                     let decoded = try JSONDecoder().decode([RemoteMachine].self, from: data)
@@ -105,6 +114,23 @@ enum Smoke {
                 let report = try TBCore.remoteAgentsReport(home: home)
                 return "\(report.entries.count) agents, \(report.totalMessages) messages"
             }
+        }
+
+        // Scheduler arming: `startScheduler()` used to invert its guard, so the
+        // first call (app launch, nil task) returned early and the hourly mirror
+        // sync never ran — mirrors froze until a manual "Sync now". Assert the
+        // launch case stays armable without spawning the loop in a CLI run.
+        summarize("remoteScheduler") {
+            let armsOnLaunch = RemoteMachineStore.shouldStartScheduler(existing: nil)
+            let liveTask = Task {}
+            let armsOverLive = RemoteMachineStore.shouldStartScheduler(existing: liveTask)
+            liveTask.cancel()
+            let armsAfterCancel = RemoteMachineStore.shouldStartScheduler(existing: liveTask)
+            guard armsOnLaunch, !armsOverLive, armsAfterCancel else {
+                throw SmokeFailure(
+                    "launch=\(armsOnLaunch) overLive=\(armsOverLive) afterCancel=\(armsAfterCancel)")
+            }
+            return "arms on launch, not over a live loop, re-arms after cancel"
         }
 
         summarize("trace") {

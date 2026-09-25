@@ -19,6 +19,10 @@ final class RemoteMachineStore {
 
     private(set) var machines: [RemoteMachine] = []
     private(set) var lastSyncError: String?
+    /// True when the text above includes a root that failed outright, rather
+    /// than only a transient partial-transfer warning. Drives the settings
+    /// row's red-vs-orange treatment.
+    private(set) var lastSyncHadFailure = false
     private var syncTask: Task<Void, Never>?
     private var nextScheduledSync = Date.distantPast
 
@@ -88,10 +92,23 @@ final class RemoteMachineStore {
 
     // MARK: - Scheduling
 
+    /// Whether `startScheduler()` should arm the loop for the given task state.
+    /// Split out so the smoke check can pin the launch case (no task yet) that
+    /// the previous inverted guard rejected.
+    nonisolated static func shouldStartScheduler(existing: Task<Void, Never>?) -> Bool {
+        guard let existing else { return true }
+        return existing.isCancelled
+    }
+
     /// Start the hourly loop. Called once at launch (and restartable after a
     /// settings change); never started in demo mode.
     func startScheduler() {
-        guard !(syncTask?.isCancelled ?? true) else { return }
+        // Start only when no live task exists. The previous spelling,
+        // `guard !(syncTask?.isCancelled ?? true)`, inverted this: a nil task
+        // coalesced to `true`, so the very first call (app launch) returned
+        // early and the hourly loop never started — only the manual "Sync now"
+        // button ever synced a mirror.
+        guard Self.shouldStartScheduler(existing: syncTask) else { return }
         syncTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -123,14 +140,56 @@ final class RemoteMachineStore {
         }
     }
 
+    /// One root's rsync outcome. `error == nil` means the root mirrored cleanly.
+    struct RootSyncOutcome: Sendable {
+        let remotePath: String
+        let error: String?
+        /// True for rsync's partial-transfer codes (23/24): source files
+        /// vanished mid-run (a live SQLite checkpointing its WAL sidecars) or a
+        /// few files failed. The mirror did advance and the next pass repairs
+        /// it, so this warns instead of vetoing the clean-sync stamp.
+        let isTransient: Bool
+    }
+
     /// rsync one machine's agent roots into its mirror home.
+    ///
+    /// The rsync loop blocks (Process + waitUntilExit) and a first sync moves
+    /// gigabytes, so it runs detached from the main actor: the popover keeps
+    /// drawing while the mirror catches up.
     func sync(_ machine: RemoteMachine) async {
         guard let mirror = mirrorHomeDirectory(for: machine.name) else { return }
         let home = mirror.appendingPathComponent("home", isDirectory: true)
         try? FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
 
-        var results: [String] = []
-        var anyFailure = false
+        let outcomes = await Task.detached(priority: .utility) {
+            Self.mirrorRoots(of: machine, into: home)
+        }.value
+
+        let messages = outcomes.compactMap { outcome -> String? in
+            guard let error = outcome.error else { return nil }
+            return "\(outcome.isTransient ? "warning" : "error"): \(machine.name): \(outcome.remotePath): \(error)"
+        }
+        lastSyncHadFailure = outcomes.contains { $0.error != nil && !$0.isTransient }
+        lastSyncError = messages.isEmpty ? nil : messages.joined(separator: "\n")
+
+        guard let index = machines.firstIndex(where: { $0.name == machine.name }) else { return }
+        let now = UInt64(Date().timeIntervalSince1970)
+        if !lastSyncHadFailure {
+            machines[index].lastSyncedAt = now
+            machines[index].lastPartialSyncedAt = nil
+        } else if outcomes.contains(where: { $0.error == nil }) {
+            // Some roots landed, so the mirror did advance even though one root
+            // failed. Keep `lastSyncedAt` as "last fully clean sync" and record
+            // the partial one separately, so Settings cannot read as frozen
+            // while data is actually flowing.
+            machines[index].lastPartialSyncedAt = now
+        }
+        save()
+    }
+
+    /// Blocking rsync of every mirrored root. Never call this on the main actor.
+    nonisolated static func mirrorRoots(of machine: RemoteMachine, into home: URL) -> [RootSyncOutcome] {
+        var outcomes: [RootSyncOutcome] = []
         for root in RemoteMachine.mirroredRoots {
             let destination = home.appendingPathComponent(root.mirrorRelative, isDirectory: true)
             try? FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
@@ -145,31 +204,33 @@ final class RemoteMachineStore {
                 "\(machine.sshDestination):\(root.remotePath)/",
                 destination.path + "/",
             ]
-            let pipe = Pipe()
-            process.standardError = pipe
-            process.standardOutput = Pipe()
+            let errors = Pipe()
+            process.standardError = errors
+            // Discard stdout: nothing reads it, and a full 64 KiB pipe buffer
+            // would deadlock rsync against waitUntilExit().
+            process.standardOutput = FileHandle.nullDevice
             do {
                 try process.run()
+                // Drain stderr to EOF before waiting: EOF is the child closing
+                // the pipe, so this cannot deadlock on a full stderr buffer.
+                let data = errors.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if process.terminationStatus != 0 {
-                    anyFailure = true
-                    results.append("\(root.remotePath): \(String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "rsync failed")")
+                let message = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if process.terminationStatus == 0 {
+                    outcomes.append(RootSyncOutcome(remotePath: root.remotePath, error: nil, isTransient: false))
+                } else {
+                    let detail = message.flatMap { $0.isEmpty ? nil : $0 }
+                        ?? "rsync exited \(process.terminationStatus)"
+                    let transient = process.terminationStatus == 23 || process.terminationStatus == 24
+                    outcomes.append(RootSyncOutcome(
+                        remotePath: root.remotePath, error: detail, isTransient: transient))
                 }
             } catch {
-                anyFailure = true
-                results.append("\(root.remotePath): \(error.localizedDescription)")
+                outcomes.append(RootSyncOutcome(
+                    remotePath: root.remotePath, error: error.localizedDescription, isTransient: false))
             }
         }
-
-        if anyFailure {
-            lastSyncError = results.joined(separator: "\n")
-        } else {
-            lastSyncError = nil
-            if let index = machines.firstIndex(where: { $0.name == machine.name }) {
-                machines[index].lastSyncedAt = UInt64(Date().timeIntervalSince1970)
-                save()
-            }
-        }
+        return outcomes
     }
 }

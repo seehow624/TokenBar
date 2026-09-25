@@ -33,7 +33,7 @@ struct RemoteMachinesSection: View {
             if let error = store.lastSyncError {
                 Text(error)
                     .font(.caption2)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(store.lastSyncHadFailure ? Color.red : Color.orange)
                     .lineLimit(3)
             }
             if let lastAction {
@@ -62,7 +62,8 @@ struct RemoteMachinesSection: View {
                         name: machine.name,
                         sshDestination: machine.sshDestination,
                         isEnabled: next,
-                        lastSyncedAt: machine.lastSyncedAt))
+                        lastSyncedAt: machine.lastSyncedAt,
+                        lastPartialSyncedAt: machine.lastPartialSyncedAt))
                 }))
             .labelsHidden()
             .toggleStyle(.switch)
@@ -80,6 +81,11 @@ struct RemoteMachinesSection: View {
                 Text(syncedLabel(synced))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            } else if let partial = machine.lastPartialSyncedAt {
+                Text(syncedLabel(partial, prefix: "partially synced"))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("Some mirrored roots landed and at least one failed; see the error below")
             } else {
                 Text("never synced")
                     .font(.caption2)
@@ -122,10 +128,10 @@ struct RemoteMachinesSection: View {
         lastAction = store.lastSyncError == nil ? "Synced \(machine.name)." : nil
     }
 
-    private func syncedLabel(_ seconds: UInt64) -> String {
+    private func syncedLabel(_ seconds: UInt64, prefix: String = "synced") -> String {
         let interval = TimeInterval(seconds)
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short
-        return "synced \(formatter.localizedString(for: Date(timeIntervalSince1970: interval), relativeTo: Date()))"
+        return "\(prefix) \(formatter.localizedString(for: Date(timeIntervalSince1970: interval), relativeTo: Date()))"
     }
 }
