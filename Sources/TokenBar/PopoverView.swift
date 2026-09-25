@@ -79,6 +79,7 @@ struct PopoverView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            scanningBanner
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
@@ -187,6 +188,27 @@ struct PopoverView: View {
     }
 
     // MARK: - Sections
+
+    /// Shown while a remote-machine scope is refreshing. Remote mirrors are
+    /// uncached, so re-scanning can take a couple of minutes — without a
+    /// prominent indicator the popover reads as frozen while the previous
+    /// data stays on screen.
+    @ViewBuilder private var scanningBanner: some View {
+        if model.refreshing, let scope = model.machineScope,
+           scope != DashboardModel.MachineScope.local {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Scanning \(scope == DashboardModel.MachineScope.combined ? "all machines" : scope)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.08))
+        }
+    }
 
     private var header: some View {
         HStack {

@@ -20,7 +20,7 @@ struct AuthEntry {
 
 /// Subscription-style API-key providers (flat-rate plans, not metered keys).
 /// Metered keys (e.g. openrouter) are deliberately excluded.
-const API_SUBSCRIPTION_PROVIDERS: &[&str] = &["opencode-go", "minimax-coding-plan"];
+const API_SUBSCRIPTION_PROVIDERS: &[&str] = &["opencode-go", "minimax-coding-plan", "ollama-cloud"];
 
 /// Friendly subscription labels for opencode's OAuth providers (plus the
 /// allowlisted api-type subscription providers), in a stable order.
@@ -61,6 +61,7 @@ fn subscription_label(provider: &str) -> String {
         "google" | "gemini" => "Gemini".to_string(),
         "opencode-go" => "opencode Go".to_string(),
         "minimax-coding-plan" => "MiniMax Coding Plan".to_string(),
+        "ollama-cloud" => "Ollama Cloud".to_string(),
         other => {
             let mut chars = other.chars();
             match chars.next() {
@@ -131,12 +132,18 @@ mod tests {
             "github-copilot": {"type": "oauth", "refresh": "x"},
             "opencode-go": {"type": "api", "key": "k"},
             "minimax-coding-plan": {"type": "api", "key": "k"},
+            "ollama-cloud": {"type": "api", "key": "k"},
             "openrouter": {"type": "api", "key": "k"}
         }"#;
         // openrouter is a plain metered API key, not a subscription → must not appear
         assert_eq!(
             detect_subscriptions_from_raw(raw),
-            vec!["Copilot", "MiniMax Coding Plan", "opencode Go"]
+            vec![
+                "Copilot",
+                "MiniMax Coding Plan",
+                "Ollama Cloud",
+                "opencode Go",
+            ]
         );
     }
 

@@ -18,6 +18,7 @@ mod agent_antigravity;
 mod agent_copilot;
 mod agent_grok;
 mod agent_history;
+mod agent_minimax;
 mod agent_ollama;
 mod agent_opencode_go;
 mod quota_html;
@@ -173,6 +174,25 @@ unsafe fn clients_from(clients: *const c_char) -> Result<Option<Vec<String>>, St
     Ok(if list.is_empty() { None } else { Some(list) })
 }
 
+/// Read a remote-machine mirror home path from the C side. NULL/empty is
+/// rejected: the remote entry points exist precisely to scan a mirror, so a
+/// missing home would silently fall back to this machine's data.
+///
+/// # Safety
+/// `home` must be NULL or a valid NUL-terminated string.
+unsafe fn home_from(home: *const c_char) -> Result<String, String> {
+    if home.is_null() {
+        return Err("remote home must not be NULL".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(home) }
+        .to_str()
+        .map_err(|_| "remote home is not valid UTF-8".to_string())?;
+    if raw.trim().is_empty() {
+        return Err("remote home must not be empty".to_string());
+    }
+    Ok(raw.trim().to_string())
+}
+
 fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     // Read the entry and release the lock before any filesystem I/O — never hold
     // GRAPH_CACHE across the mtime stat sweep below (mirrors graph_compute, which
@@ -207,7 +227,7 @@ fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
     // past this token, so the next aged-out read recomputes rather than
     // serving a graph that missed it.
     let token = tokscale_core::latest_source_mtime_ms(&Default::default()).unwrap_or(0);
-    let data = usage_graph::run(year)?;
+    let data = usage_graph::run(year, None)?;
     GRAPH_CACHE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -295,6 +315,23 @@ pub unsafe extern "C" fn tb_graph(year: *const c_char) -> *mut c_char {
     })
 }
 
+/// Contribution-graph payload for `year`, scanned from the mirror layout
+/// under `home` — a remote machine's agent data rsynced into a fake home
+/// (e.g. `~/Library/Application Support/TokenBar/RemoteMachines/mini/home`).
+/// Always recomputes (no cache): the remote snapshot updates at most hourly.
+///
+/// # Safety
+/// `year` and `home` must each be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_graph_remote(year: *const c_char, home: *const c_char) -> *mut c_char {
+    guarded("tb_graph_remote", || {
+        envelope(unsafe { year_from(year) }.and_then(|year| {
+            let home = unsafe { home_from(home)? };
+            usage_graph::run(&year, Some(&home))
+        }))
+    })
+}
+
 /// Force-recompute the contribution graph for `year`, bypassing the cache.
 ///
 /// # Safety
@@ -313,7 +350,25 @@ pub unsafe extern "C" fn tb_refresh_graph(year: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_model_report(year: *const c_char) -> *mut c_char {
     guarded("tb_model_report", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| model_report::run(&year)))
+        envelope(unsafe { year_from(year) }.and_then(|year| model_report::run(&year, None)))
+    })
+}
+
+/// Per-model report for `year`, scanned from the mirror layout under `home`
+/// (remote-machine view). Always recomputes; see `tb_graph_remote`.
+///
+/// # Safety
+/// `year` and `home` must each be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_model_report_remote(
+    year: *const c_char,
+    home: *const c_char,
+) -> *mut c_char {
+    guarded("tb_model_report_remote", || {
+        envelope(unsafe { year_from(year) }.and_then(|year| {
+            let home = unsafe { home_from(home)? };
+            model_report::run(&year, Some(&home))
+        }))
     })
 }
 
@@ -332,7 +387,27 @@ pub unsafe extern "C" fn tb_hourly_report(
     guarded("tb_hourly_report", || {
         envelope(unsafe { year_from(year) }.and_then(|year| {
             let clients = unsafe { clients_from(clients) }?;
-            hourly_report::run(&year, clients)
+            hourly_report::run(&year, clients, None)
+        }))
+    })
+}
+
+/// Per-hour report for `year`, scanned from the mirror layout under `home`
+/// (remote-machine view). Always recomputes; see `tb_graph_remote`.
+///
+/// # Safety
+/// `year`, `clients`, and `home` must each be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_hourly_report_remote(
+    year: *const c_char,
+    clients: *const c_char,
+    home: *const c_char,
+) -> *mut c_char {
+    guarded("tb_hourly_report_remote", || {
+        envelope(unsafe { year_from(year) }.and_then(|year| {
+            let clients = unsafe { clients_from(clients) }?;
+            let home = unsafe { home_from(home)? };
+            hourly_report::run(&year, clients, Some(&home))
         }))
     })
 }
@@ -353,7 +428,27 @@ pub unsafe extern "C" fn tb_agents_report(
     guarded("tb_agents_report", || {
         envelope(unsafe { year_from(year) }.and_then(|year| {
             let clients = unsafe { clients_from(clients) }?;
-            agents_report::run(&year, clients)
+            agents_report::run(&year, clients, None)
+        }))
+    })
+}
+
+/// Per-(sub-)agent report for `year`, scanned from the mirror layout under
+/// `home` (remote-machine view). Always recomputes; see `tb_graph_remote`.
+///
+/// # Safety
+/// `year`, `clients`, and `home` must each be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_agents_report_remote(
+    year: *const c_char,
+    clients: *const c_char,
+    home: *const c_char,
+) -> *mut c_char {
+    guarded("tb_agents_report_remote", || {
+        envelope(unsafe { year_from(year) }.and_then(|year| {
+            let clients = unsafe { clients_from(clients) }?;
+            let home = unsafe { home_from(home)? };
+            agents_report::run(&year, clients, Some(&home))
         }))
     })
 }
@@ -448,6 +543,55 @@ mod tests {
         let s = unsafe { take(p) };
         assert!(s.contains(r#""ok":false"#), "got: {s}");
         assert!(s.contains("tb_test panicked: boom"), "got: {s}");
+    }
+
+    #[test]
+    fn home_from_rejects_null_and_empty() {
+        assert!(unsafe { home_from(std::ptr::null()) }.is_err());
+        assert!(unsafe { home_from(c"".as_ptr()) }.is_err());
+        assert!(unsafe { home_from(c"   ".as_ptr()) }.is_err());
+        assert_eq!(
+            unsafe { home_from(c"/tmp/mirror".as_ptr()) }.unwrap(),
+            "/tmp/mirror"
+        );
+    }
+
+    #[test]
+    fn remote_graph_scans_only_the_mirror_home() {
+        // A mirror home holds a fake `~/.claude/projects` tree. The remote
+        // entry must report those messages and must NOT be affected by the
+        // caller's real HOME (env roots are disabled for remote scans).
+        let mirror_dir = std::env::temp_dir().join(format!(
+            "tokenbar-remote-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let claude_dir = mirror_dir.join(".claude/projects/demo");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("session.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-06-24T01:00:00.000Z","message":{"model":"claude-3-5-sonnet","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        )
+        .unwrap();
+
+        let year = c"2026".as_ptr();
+        let home = mirror_dir.as_os_str().to_str().unwrap();
+        let home_ptr = home.as_ptr() as *const c_char;
+        let p = unsafe { tb_graph_remote(year, home_ptr) };
+        let s = unsafe { take(p) };
+        let _ = std::fs::remove_dir_all(&mirror_dir);
+        assert!(s.contains(r#""ok":true"#), "got: {s}");
+        assert!(s.contains(r#""claude-3-5-sonnet""#), "got: {s}");
+        assert!(s.contains(r#""totalTokens":15"#), "got: {s}");
+    }
+
+    #[test]
+    fn remote_entry_rejects_missing_home() {
+        let year = c"2026".as_ptr();
+        let p = unsafe { tb_graph_remote(year, std::ptr::null()) };
+        let s = unsafe { take(p) };
+        assert!(s.contains(r#""ok":false"#), "got: {s}");
+        assert!(s.contains("remote home must not be NULL"), "got: {s}");
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
 use crate::agent_history;
+use crate::agent_minimax;
 use crate::agent_ollama;
 use crate::agent_opencode_go;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
@@ -322,14 +323,15 @@ struct ClaudeRefreshResponse {
 
 pub async fn run() -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (codex, claude, antigravity, copilot, grok, opencode_go, ollama) = tokio::join!(
+    let (codex, claude, antigravity, copilot, grok, opencode_go, ollama, minimax) = tokio::join!(
         fetch_codex(),
         fetch_claude(),
         fetch_antigravity(),
         fetch_copilot(),
         fetch_grok(),
         fetch_opencode_go(),
-        fetch_ollama()
+        fetch_ollama(),
+        fetch_minimax()
     );
     let mut agents = vec![codex, claude, antigravity];
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
@@ -344,9 +346,15 @@ pub async fn run() -> AgentUsagePayload {
     if let Some(opencode_go) = opencode_go {
         agents.push(opencode_go);
     }
-    // Ollama only appears on machines that have ~/.ollama.
+    // Ollama appears when a local install, API key, or OpenCode cloud
+    // configuration indicates that the provider is in use.
     if let Some(ollama) = ollama {
         agents.push(ollama);
+    }
+    // MiniMax only appears when MINIMAX_API_KEY is set or opencode has a
+    // minimax-coding-plan credential.
+    if let Some(minimax) = minimax {
+        agents.push(minimax);
     }
     AgentUsagePayload {
         generated_at,
@@ -431,6 +439,23 @@ async fn fetch_ollama() -> Option<AgentUsageSnapshot> {
     Some(AgentUsageSnapshot {
         client_id: "ollama".to_string(),
         source: data.source,
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: data.identity,
+        windows: data.windows,
+        credits: None,
+        error: data.error,
+    })
+}
+
+async fn fetch_minimax() -> Option<AgentUsageSnapshot> {
+    if !agent_minimax::has_minimax() {
+        return None;
+    }
+    let now = Utc::now();
+    let data = agent_minimax::fetch(now).await;
+    Some(AgentUsageSnapshot {
+        client_id: "minimax".to_string(),
+        source: "api".to_string(),
         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
         identity: data.identity,
         windows: data.windows,

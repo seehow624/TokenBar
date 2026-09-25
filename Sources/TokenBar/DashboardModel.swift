@@ -63,6 +63,7 @@ private struct DashboardSnapshot {
 
     private(set) var phase: Phase
     private static let yearKey = "tokenbar.dashboard.year"
+    private static let machineScopeKey = "tokenbar.dashboard.machineScope"
 
     /// Resolve the active year filter: the `--year=` debug flag wins, else the
     /// persisted selection. Shared by `init()`'s snapshot guard and the `year`
@@ -114,12 +115,27 @@ private struct DashboardSnapshot {
     private(set) var year: String? = DashboardModel.resolveYear()
     /// Machine scope for the base lenses. nil = this machine only; a machine
     /// name = that machine's mirror only; `.combined` = every machine summed.
-    private(set) var machineScope: String?
-    /// The combined view is the default when any enabled mirror exists.
+    /// Persisted, so a mirror choice survives the popover's teardown/rebuild
+    /// cycle and an app relaunch.
+    private(set) var machineScope: String? = DashboardModel.resolveMachineScope()
+    /// True while the combined view is selected. Not a default: the default
+    /// stays this machine, so a stale mirror never silently rewrites the base
+    /// lenses on a machine the user did not ask to see.
     var isCombinedScope: Bool { machineScope == MachineScope.combined }
     enum MachineScope {
         static let combined = "⌥combined"
         static let local = "⌥local"
+    }
+
+    /// Resolve the persisted machine scope. nil/absent = this machine; the
+    /// picker also emits the `⌥local` sentinel for that row, so both spellings
+    /// collapse to nil instead of storing the same state twice.
+    private static func resolveMachineScope() -> String? {
+        guard let stored = UserDefaults.standard.string(forKey: machineScopeKey),
+              !stored.isEmpty,
+              stored != MachineScope.local
+        else { return nil }
+        return stored
     }
     /// Union of `payload.years` across loads — a year-filtered payload only
     /// reports the selected year, so remember the rest for the picker.
@@ -182,14 +198,16 @@ private struct DashboardSnapshot {
             let scope = self.machineScope
             let machines = RemoteMachineStore.shared.enabledMachines
             remoteMachines = machines
+            reconcileMachineScope(with: machines)
             async let payloadTask = source.graph(year: year, priority: .userInitiated)
             async let reportTask = source.modelReport(year: year, priority: .userInitiated)
             let payload = try await payloadTask
             let report = try? await reportTask
-            // Remote payloads (only when the scope can include a mirror).
+            // Remote payloads (only when the scope can include a mirror: a
+            // named machine or the combined view; the local scope skips them).
             let remote: [String: UsagePayload]
             let remoteReports: [String: ModelReport]
-            if !machines.isEmpty, scope == MachineScope.combined {
+            if !machines.isEmpty, let scope, scope != MachineScope.local {
                 remote = await fetchRemotePayloads(year: year)
                 remoteReports = await fetchRemoteReports(year: year)
             } else {
@@ -201,14 +219,10 @@ private struct DashboardSnapshot {
             // so apply() never tags the new year — and the static snapshot —
             // with the old year's payload. Mirrors reload()/pollGraph().
             guard self.year == year else { return }
-            if isCombinedScope, !remote.isEmpty {
-                apply(
-                    payload: RemoteUsage(local: payload, remote: remote).combined,
-                    report: RemoteUsage.mergeModelReports([report].compactMap { $0 } + remoteReports.values.map { $0 })
-                )
-            } else {
-                apply(payload: payload, report: report)
-            }
+            apply(
+                payload: scopedPayload(scope: scope, local: payload, remote: remote),
+                report: scopedReport(scope: scope, report: report, remoteReports: remoteReports)
+            )
         } catch {
             // Keep showing stale data over an error screen when a previous
             // load succeeded — a transient failure must not blank the UI.
@@ -216,6 +230,36 @@ private struct DashboardSnapshot {
                 phase = .failed("Failed to load usage: \(error)")
             }
         }
+    }
+
+    /// The payload the current scope should display: the named machine's
+    /// mirror payload, the combined (merged) view, or the local payload when
+    /// no remote data is available for the requested scope.
+    private func scopedPayload(
+        scope: String?, local: UsagePayload, remote: [String: UsagePayload]
+    ) -> UsagePayload {
+        if let scope, scope != MachineScope.local, let machinePayload = remote[scope] {
+            return machinePayload
+        }
+        if scope == MachineScope.combined, !remote.isEmpty {
+            return RemoteUsage(local: local, remote: remote).combined
+        }
+        return local
+    }
+
+    /// The model report for the current scope: the named machine's own
+    /// report, the merged reports for the combined view, or the local one.
+    private func scopedReport(
+        scope: String?, report: ModelReport?, remoteReports: [String: ModelReport]
+    ) -> ModelReport? {
+        if let scope, scope != MachineScope.local, let machineReport = remoteReports[scope] {
+            return machineReport
+        }
+        if scope == MachineScope.combined, !remoteReports.isEmpty {
+            return RemoteUsage.mergeModelReports(
+                [report].compactMap { $0 } + remoteReports.values.map { $0 })
+        }
+        return report
     }
 
     /// Fetch the remote-machine payloads the current scope needs, keyed by
@@ -274,15 +318,32 @@ private struct DashboardSnapshot {
         await reload(force: false)
     }
 
-    /// Switch the machine scope (local / combined / a named remote mirror)
-    /// and re-fetch every lens for the new slice. The scope is not persisted:
-    /// a freshly configured mirror defaults to the combined view on next load.
+    /// Switch the machine scope (local / combined / a named remote mirror),
+    /// persist the choice, and re-fetch every lens for the new slice.
     func setMachineScope(_ scope: String?) async {
         guard scope != machineScope, !refreshing else { return }
         machineScope = scope
+        if let scope, scope != MachineScope.local {
+            UserDefaults.standard.set(scope, forKey: Self.machineScopeKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.machineScopeKey)
+        }
         refreshing = true
         defer { refreshing = false }
         await reload(force: false)
+    }
+
+    /// Drop a persisted scope whose machine no longer exists, so the picker
+    /// never holds a tag it cannot render and the lenses cannot fall back to
+    /// local data while still displaying a machine name.
+    private func reconcileMachineScope(with machines: [RemoteMachine]) {
+        guard let scope = machineScope,
+              scope != MachineScope.local,
+              scope != MachineScope.combined,
+              !machines.contains(where: { $0.name == scope })
+        else { return }
+        machineScope = nil
+        UserDefaults.standard.removeObject(forKey: Self.machineScopeKey)
     }
 
     /// Auto-clear a year filter scoped to a year that only hidden clients used.
@@ -306,24 +367,20 @@ private struct DashboardSnapshot {
         let year = self.year
         let machines = RemoteMachineStore.shared.enabledMachines
         remoteMachines = machines
+        reconcileMachineScope(with: machines)
         async let payloadTask = force
             ? source.refreshGraph(year: year, priority: .userInitiated)
             : source.graph(year: year, priority: .userInitiated)
         async let reportTask = source.modelReport(year: year, priority: .userInitiated)
         guard let payload = try? await payloadTask else { return }
         let report = try? await reportTask
-        if isCombinedScope, !machines.isEmpty {
+        if !machines.isEmpty, let scope = machineScope, scope != MachineScope.local {
             let remote = await fetchRemotePayloads(year: year)
             let remoteReports = await fetchRemoteReports(year: year)
-            if !remote.isEmpty {
-                apply(
-                    payload: RemoteUsage(local: payload, remote: remote).combined,
-                    report: RemoteUsage.mergeModelReports(
-                        [report].compactMap { $0 } + remoteReports.values.map { $0 })
-                )
-            } else {
-                apply(payload: payload, report: report)
-            }
+            apply(
+                payload: scopedPayload(scope: scope, local: payload, remote: remote),
+                report: scopedReport(scope: scope, report: report, remoteReports: remoteReports)
+            )
         } else {
             apply(payload: payload, report: report)
         }
@@ -421,6 +478,10 @@ private struct DashboardSnapshot {
             // Don't race an in-flight manual Refresh or year switch.
             guard !refreshing else { continue }
             let year = self.year
+            let scope = self.machineScope
+            let machines = RemoteMachineStore.shared.enabledMachines
+            remoteMachines = machines
+            reconcileMachineScope(with: machines)
             async let payloadTask = source.graph(year: year, priority: .utility)
             async let reportTask = source.modelReport(year: year, priority: .utility)
             let fetched = try? await payloadTask
@@ -429,6 +490,14 @@ private struct DashboardSnapshot {
             // The year may have changed while we were off-actor; drop a stale
             // slice so the chart never flickers to the wrong year.
             guard self.year == year, let payload = fetched else { continue }
+            // A background tick must never revert a remote scope to this
+            // machine's data. Remote mirrors are snapshots: re-scanning them
+            // every minute is wasteful (and would thrash the UI), so they only
+            // refresh on a scope switch, a manual Refresh, or the next popover
+            // open — the local scope keeps its live-advancing behavior.
+            if !machines.isEmpty, let scope, scope != MachineScope.local {
+                continue
+            }
             apply(payload: payload, report: report)
             // apply() may have cleared a now-empty year filter and spawned an
             // unfiltered reload; skip the stale-`year` lazy re-fetch so it

@@ -50,8 +50,10 @@ char *tb_usage_trace(int64_t window_secs);
 // Live rate: {"tokensPerMin": <number>} (10-minute-window average).
 char *tb_tokens_per_min(void);
 
-// OAuth quota cards (AgentUsagePayload) for codex/claude/antigravity/copilot.
-// Network-bound; per-provider failures are reported inside each snapshot.
+// OAuth/subscription quota cards (AgentUsagePayload) for codex, claude,
+// antigravity, copilot, grok, OpenCode Go, Ollama Cloud, and other configured
+// providers. Network-bound; per-provider failures are reported inside each
+// snapshot.
 char *tb_agent_usage(void);
 
 // Release a string returned by any tb_* entry point.

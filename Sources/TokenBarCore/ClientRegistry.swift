@@ -46,6 +46,7 @@ public enum ClientRegistry {
         "gjc": ("gjc", "#e11d48"),
         "grok": ("Grok Build", "#1f2937"),
         "ollama": ("Ollama Cloud", "#1f2937"),
+        "minimax": ("MiniMax", "#6b21a8"),
     ]
 
     /// Every registered client id, sorted. Demo fixtures use this canonical

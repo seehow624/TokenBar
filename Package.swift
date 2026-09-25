@@ -1,8 +1,12 @@
 // swift-tools-version: 6.0
+import Foundation
 import PackageDescription
 
 // The Rust staticlib must be built first: `cargo build --release` (or `make`).
-// `swift build` must run from the repo root so the relative -L path resolves.
+// Direct `swift build` keeps the historical target/release default; Makefile
+// builds can point this at CARGO_TARGET_DIR on a local volume instead.
+let rustLibraryDir = ProcessInfo.processInfo.environment["TOKENBAR_RUST_LIBRARY_DIR"] ?? "target/release"
+
 let package = Package(
     name: "TokenBar",
     platforms: [.macOS(.v14)],
@@ -35,11 +39,12 @@ let package = Package(
     ]
 )
 
-// The Rust staticlib must already exist (cargo build --release) and the link
-// must run from the repo root for the relative -L path to resolve.
+// The Rust staticlib must already exist (cargo build --release). The linker
+// directory is supplied by Makefile for alternate Cargo target directories;
+// direct SwiftPM invocations retain the repository-root default.
 var rustLinkerSettings: [LinkerSetting] {
     [
-        .unsafeFlags(["-L", "target/release", "-ltb_core_ffi"]),
+        .unsafeFlags(["-L", rustLibraryDir, "-ltb_core_ffi"]),
         // Sparkle.framework rides in Contents/Frameworks inside the .app.
         .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         .linkedFramework("Security"),

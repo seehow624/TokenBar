@@ -20,6 +20,7 @@ pub(crate) fn parse_resets_in(text: &str, now: DateTime<Utc>) -> Option<DateTime
             // "token doesn't match" instead of panicking — this text comes
             // from a live third-party page and we sit behind an FFI boundary.
             let step = match unit {
+                "week" => Duration::try_weeks(n),
                 "day" => Duration::try_days(n),
                 "hour" => Duration::try_hours(n),
                 "minute" => Duration::try_minutes(n),
@@ -209,6 +210,7 @@ mod tests {
                 Duration::days(23) + Duration::hours(3),
             ),
             ("Resets in 1 minute", Duration::minutes(1)),
+            ("Resets in 4 weeks.", Duration::weeks(4)),
             ("Resets in 2 hours.", Duration::hours(2)), // ollama copy ends with a period
         ];
         for (text, expected) in cases {

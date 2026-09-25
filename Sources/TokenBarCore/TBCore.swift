@@ -214,8 +214,9 @@ public enum TBCore {
         return payload.tokensPerMin
     }
 
-    /// OAuth quota cards for codex/claude/antigravity/copilot/grok. Network-bound;
-    /// per-provider failures are reported in each snapshot's `error`.
+    /// OAuth/subscription quota cards for configured providers, including
+    /// codex/claude/antigravity/copilot/grok, OpenCode Go, and Ollama Cloud.
+    /// Network-bound; per-provider failures are reported in each snapshot's `error`.
     public static func agentUsage() throws -> AgentUsagePayload {
         try unwrap(tb_agent_usage())
     }

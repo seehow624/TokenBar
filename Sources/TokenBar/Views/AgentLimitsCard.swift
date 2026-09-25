@@ -51,13 +51,15 @@ struct AgentLimitsCard: View {
         "claude": ["Session", "Weekly"],
         "gemini": ["Pro", "Flash"],
         "grok": ["Weekly"],
+        "ollama": ["Monthly"],
+        "minimax": ["5h", "Weekly"],
     ]
 
     /// Maps opencode subscription labels (from the backend) to the agent
     /// client ids whose quota cards represent them.
     private static let subLabelToId: [String: String] = [
         "Codex": "codex", "Claude": "claude", "Copilot": "copilot",
-        "Gemini": "antigravity",
+        "Gemini": "antigravity", "Ollama Cloud": "ollama",
     ]
 
     /// Every client id that can show a row in the multi-agent Agent-limits
@@ -252,7 +254,7 @@ struct AgentLimitsCard: View {
             if snapshot?.source == "unconfigured" {
                 setupPrompt()
             } else {
-                if let detail = detailText(snapshot) {
+                if let detail = detailText(snapshot, clientId: id) {
                     Text(detail)
                         .font(.caption2)
                         .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
@@ -350,10 +352,13 @@ struct AgentLimitsCard: View {
             .foregroundStyle(color)
     }
 
-    private func detailText(_ snapshot: AgentUsageSnapshot?) -> String? {
+    private func detailText(_ snapshot: AgentUsageSnapshot?, clientId: String) -> String? {
         guard let snapshot else { return nil }
         if let error = snapshot.error { return error }
-        let parts = [snapshot.identity?.email, snapshot.identity?.plan].compactMap(\.self)
+        var parts = [snapshot.identity?.email, snapshot.identity?.plan].compactMap(\.self)
+        if clientId == "ollama", snapshot.source == "local", snapshot.windows.isEmpty {
+            parts.append("Usage: save the ollama.com Cookie as Keychain item tokenbar-ollama-cookie")
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
