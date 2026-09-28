@@ -7,3 +7,7 @@ target/
 .agent-local/
 dist/
 .omo/
+
+# Private agent working notes: keep on disk, never track (machine paths + operator steps).
+docs/superpowers/plans/
+docs/superpowers/specs/*.md
