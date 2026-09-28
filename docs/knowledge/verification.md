@@ -63,6 +63,14 @@ swift run TokenBar --selftest
 swift run TokenBar --smoke
 ```
 
+When the checkout volume has unreliable metadata I/O, keep the same build order
+but place SwiftPM's derived data on a local volume:
+
+```bash
+CARGO_TARGET_DIR=/tmp/tokenbar-cargo-target \
+SWIFT_BUILD_PATH=/tmp/tokenbar-swift-build make build
+```
+
 ### Local full code-change gates
 
 For Rust or cross-language code changes, the local full gate adds formatting, the Rust test suite, the all-targets Clippy pass, and the repository build:

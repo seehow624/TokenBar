@@ -80,8 +80,10 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
 
     // language-server ports use the language-server CSRF; the extension server
     // (if advertised) carries its own token.
-    let mut candidates: Vec<(u16, String)> =
-        ports.iter().map(|p| (*p, proc.csrf_token.clone())).collect();
+    let mut candidates: Vec<(u16, String)> = ports
+        .iter()
+        .map(|p| (*p, proc.csrf_token.clone()))
+        .collect();
     if let Some(port) = proc.extension_port {
         if let Some(csrf) = proc.extension_csrf.as_ref() {
             candidates.push((port, csrf.clone()));
@@ -152,7 +154,8 @@ fn detect_process() -> Result<ProcInfo, String> {
         return Ok(ProcInfo {
             pid,
             csrf_token: csrf,
-            extension_port: extract_flag(cmd, "--extension_server_port").and_then(|s| s.parse().ok()),
+            extension_port: extract_flag(cmd, "--extension_server_port")
+                .and_then(|s| s.parse().ok()),
             extension_csrf: extract_flag(cmd, "--extension_server_csrf_token"),
         });
     }
@@ -305,7 +308,12 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
         .user_tier
         .and_then(|t| t.name)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| status.plan_status.and_then(|p| p.plan_info).and_then(local_plan_name));
+        .or_else(|| {
+            status
+                .plan_status
+                .and_then(|p| p.plan_info)
+                .and_then(local_plan_name)
+        });
 
     Ok(Fetched {
         source: "cli".to_string(),
@@ -503,7 +511,8 @@ async fn fetch_model_quotas(
         Ok(value) => {
             let windows = models_from_available(&value, now);
             if windows.is_empty() {
-                let quota = code_assist_post(client, "retrieveUserQuota", &body, access_token).await?;
+                let quota =
+                    code_assist_post(client, "retrieveUserQuota", &body, access_token).await?;
                 Ok(buckets_from_quota(&quota, now))
             } else {
                 Ok(windows)
@@ -693,6 +702,17 @@ fn scan_client_ids(data: &[u8]) -> Vec<String> {
         while start > 0 && is_token_byte(data[start - 1]) {
             start -= 1;
         }
+        // The binary scan can absorb the tail of a neighbouring token. A
+        // Google client id is `<digits>-<token>` and its delimiter is the last
+        // hyphen in the segment; re-anchor there before validating the numeric
+        // project-id prefix.
+        if let Some(dash) = data[start..end].iter().rposition(|b| *b == b'-') {
+            let mut head = start + dash;
+            while head > start && data[head - 1].is_ascii_digit() {
+                head -= 1;
+            }
+            start = head;
+        }
         if let Ok(candidate) = std::str::from_utf8(&data[start..end]) {
             if valid_client_id(candidate) && !out.contains(&candidate.to_string()) {
                 out.push(candidate.to_string());
@@ -773,7 +793,10 @@ mod tests {
     fn extracts_flags_both_forms() {
         let cmd = "/x/language_server --app_data_dir /Users/me/.gemini/antigravity --csrf_token=ABC123 --extension_server_port 4567";
         assert_eq!(extract_flag(cmd, "--csrf_token").as_deref(), Some("ABC123"));
-        assert_eq!(extract_flag(cmd, "--extension_server_port").as_deref(), Some("4567"));
+        assert_eq!(
+            extract_flag(cmd, "--extension_server_port").as_deref(),
+            Some("4567")
+        );
         assert!(is_language_server(&cmd.to_lowercase()));
         assert!(is_antigravity(&cmd.to_lowercase()));
     }
@@ -790,7 +813,10 @@ mod tests {
         let blob = b"junk\x00123-abcDEF_g.apps.googleusercontent.com\x00\x00GOCSPX-abcdefghijklmnopqrstuvwxyz12\x00tail";
         let ids = scan_client_ids(blob);
         let secrets = scan_client_secrets(blob);
-        assert_eq!(ids, vec!["123-abcDEF_g.apps.googleusercontent.com".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["123-abcDEF_g.apps.googleusercontent.com".to_string()]
+        );
         assert_eq!(secrets.len(), 1);
         let client = preferred_client(&ids, &secrets).unwrap();
         assert_eq!(client.0, "123-abcDEF_g.apps.googleusercontent.com");
@@ -798,10 +824,25 @@ mod tests {
     }
 
     #[test]
+    fn scans_client_id_after_a_neighbouring_hyphenated_token() {
+        let blob = b"label123-beta456-real.apps.googleusercontent.com\x00tail";
+        assert_eq!(
+            scan_client_ids(blob),
+            vec!["456-real.apps.googleusercontent.com".to_string()]
+        );
+    }
+
+    #[test]
     fn prefers_last_id_when_single_secret() {
-        let ids = vec!["1-a.apps.googleusercontent.com".into(), "2-b.apps.googleusercontent.com".into()];
+        let ids = vec![
+            "1-a.apps.googleusercontent.com".into(),
+            "2-b.apps.googleusercontent.com".into(),
+        ];
         let secrets = vec!["GOCSPX-only".into()];
-        assert_eq!(preferred_client(&ids, &secrets).unwrap().0, "2-b.apps.googleusercontent.com");
+        assert_eq!(
+            preferred_client(&ids, &secrets).unwrap().0,
+            "2-b.apps.googleusercontent.com"
+        );
     }
 
     #[test]
@@ -822,8 +863,14 @@ mod tests {
         }"#;
         let fetched = parse_user_status(body, now).unwrap();
         assert_eq!(fetched.source, "cli");
-        assert_eq!(fetched.identity.as_ref().unwrap().email.as_deref(), Some("me@gmail.com"));
-        assert_eq!(fetched.identity.as_ref().unwrap().plan.as_deref(), Some("Pro"));
+        assert_eq!(
+            fetched.identity.as_ref().unwrap().email.as_deref(),
+            Some("me@gmail.com")
+        );
+        assert_eq!(
+            fetched.identity.as_ref().unwrap().plan.as_deref(),
+            Some("Pro")
+        );
         assert_eq!(fetched.windows.len(), 1);
         assert_eq!(fetched.windows[0].label_for_test(), "Gemini 3 Pro");
         assert!((fetched.windows[0].remaining_for_test() - 42.0).abs() < 0.01);
@@ -853,7 +900,13 @@ mod tests {
 
     #[test]
     fn resolves_remote_plan_from_tier() {
-        assert_eq!(resolve_remote_plan(&json!({"currentTier":{"id":"free-tier"}})).as_deref(), Some("Free"));
-        assert_eq!(resolve_remote_plan(&json!({"planInfo":{"planType":"standard"}})).as_deref(), Some("Standard"));
+        assert_eq!(
+            resolve_remote_plan(&json!({"currentTier":{"id":"free-tier"}})).as_deref(),
+            Some("Free")
+        );
+        assert_eq!(
+            resolve_remote_plan(&json!({"planInfo":{"planType":"standard"}})).as_deref(),
+            Some("Standard")
+        );
     }
 }

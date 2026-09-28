@@ -174,16 +174,9 @@ struct HourlyView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(isCurrent ? .primary : .secondary)
                 .frame(width: mode == .profile ? 38 : 74, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(.quaternary.opacity(0.5))
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(isCurrent ? Color.green.opacity(0.8) : Color.accentColor.opacity(0.7))
-                        .frame(width: geo.size.width * CGFloat(tokens) / CGFloat(maxTokens))
-                }
-            }
-            .frame(height: 8)
+            MeterBar(
+                fraction: Double(tokens) / Double(maxTokens),
+                color: isCurrent ? .green : .accentColor)
             Text(tokens > 0 ? Format.compactTokens(tokens) : "")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)

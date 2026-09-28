@@ -47,11 +47,17 @@ struct ModelReportData {
 }
 
 /// Build the per-model report for `year` (empty string = all time).
-pub fn run(year: &str) -> Result<Value, String> {
+///
+/// `home` is the scan home directory; `None` scans this machine's default
+/// roots (env-aware), `Some(path)` scans only the mirror layout under `path`
+/// with `use_env_roots = false` (remote-machine view, see `tb_model_report_remote`).
+pub fn run(year: &str, home: Option<&str>) -> Result<Value, String> {
     let year = normalize_year(year)?;
 
     let options = tokscale_core::ReportOptions {
         year,
+        home_dir: home.map(str::to_owned),
+        use_env_roots: home.is_none(),
         ..Default::default()
     };
 

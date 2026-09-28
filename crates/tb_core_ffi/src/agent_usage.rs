@@ -2,6 +2,9 @@ use crate::agent_antigravity;
 use crate::agent_copilot;
 use crate::agent_grok;
 use crate::agent_history;
+use crate::agent_minimax;
+use crate::agent_ollama;
+use crate::agent_opencode_go;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -139,6 +142,11 @@ impl UsageWindow {
     #[cfg(test)]
     pub(crate) fn remaining_for_test(&self) -> f64 {
         self.remaining_percent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_text_for_test(&self) -> Option<&str> {
+        self.reset_text.as_deref()
     }
 }
 
@@ -315,12 +323,15 @@ struct ClaudeRefreshResponse {
 
 pub async fn run() -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (codex, claude, antigravity, copilot, grok) = tokio::join!(
+    let (codex, claude, antigravity, copilot, grok, opencode_go, ollama, minimax) = tokio::join!(
         fetch_codex(),
         fetch_claude(),
         fetch_antigravity(),
         fetch_copilot(),
-        fetch_grok()
+        fetch_grok(),
+        fetch_opencode_go(),
+        fetch_ollama(),
+        fetch_minimax()
     );
     let mut agents = vec![codex, claude, antigravity];
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
@@ -330,6 +341,20 @@ pub async fn run() -> AgentUsagePayload {
     // Grok only appears when ~/.grok/auth.json has credentials.
     if let Some(grok) = grok {
         agents.push(grok);
+    }
+    // OpenCode Go only appears when opencode has an opencode-go credential.
+    if let Some(opencode_go) = opencode_go {
+        agents.push(opencode_go);
+    }
+    // Ollama appears when a local install, API key, or OpenCode cloud
+    // configuration indicates that the provider is in use.
+    if let Some(ollama) = ollama {
+        agents.push(ollama);
+    }
+    // MiniMax only appears when MINIMAX_API_KEY is set or opencode has a
+    // minimax-coding-plan credential.
+    if let Some(minimax) = minimax {
+        agents.push(minimax);
     }
     AgentUsagePayload {
         generated_at,
@@ -385,6 +410,57 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
             credits: None,
             error: Some(error),
         },
+    })
+}
+
+async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
+    if !crate::opencode_integrations::has_opencode_go() {
+        return None;
+    }
+    let now = Utc::now();
+    let data = agent_opencode_go::fetch(now).await;
+    Some(AgentUsageSnapshot {
+        client_id: "opencode".to_string(),
+        source: data.source,
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: data.identity,
+        windows: data.windows,
+        credits: None,
+        error: data.error,
+    })
+}
+
+async fn fetch_ollama() -> Option<AgentUsageSnapshot> {
+    if !agent_ollama::has_ollama() {
+        return None;
+    }
+    let now = Utc::now();
+    let data = agent_ollama::fetch(now).await;
+    Some(AgentUsageSnapshot {
+        client_id: "ollama".to_string(),
+        source: data.source,
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: data.identity,
+        windows: data.windows,
+        credits: None,
+        error: data.error,
+    })
+}
+
+async fn fetch_minimax() -> Option<AgentUsageSnapshot> {
+    if !agent_minimax::has_minimax() {
+        return None;
+    }
+    let now = Utc::now();
+    let data = agent_minimax::fetch(now).await;
+    Some(AgentUsageSnapshot {
+        client_id: "minimax".to_string(),
+        source: "api".to_string(),
+        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        identity: data.identity,
+        windows: data.windows,
+        credits: None,
+        error: data.error,
     })
 }
 
@@ -1649,11 +1725,16 @@ fn codex_windows(
             std::mem::swap(&mut primary, &mut secondary);
         }
 
+        // Label by the window's actual length, not its slot: plans report
+        // arbitrary windows (ChatGPT Free ships a single 30-day window that
+        // positional "5h" would mislabel).
         if let Some(window) = primary {
-            windows.push(map_window("Session", window, now));
+            let label = codex_duration_label(&window, "5h");
+            windows.push(map_window(&label, window, now));
         }
         if let Some(window) = secondary {
-            windows.push(map_window("Weekly", window, now));
+            let label = codex_duration_label(&window, "Weekly");
+            windows.push(map_window(&label, window, now));
         }
     }
 
@@ -1682,7 +1763,7 @@ fn codex_windows(
 
 fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageWindow> {
     let mut windows = Vec::new();
-    push_claude_window(&mut windows, "Session", usage.five_hour.as_ref(), now);
+    push_claude_window(&mut windows, "5h", usage.five_hour.as_ref(), now);
     push_claude_window(&mut windows, "Weekly", usage.seven_day.as_ref(), now);
     push_claude_window(
         &mut windows,
@@ -1780,7 +1861,7 @@ fn parse_unified_ratelimit_windows(
     };
     let mut windows = Vec::new();
     if let Some(window) = unified_ratelimit_window(
-        "Session",
+        "5h",
         read_f64("anthropic-ratelimit-unified-5h-utilization"),
         read_i64("anthropic-ratelimit-unified-5h-reset"),
         now,
@@ -1946,7 +2027,7 @@ fn map_window(label: &str, window: CodexWindow, now: DateTime<Utc>) -> UsageWind
 /// Standard Claude window lengths by label, since the API doesn't report them:
 /// the session bucket is 5h, everything else is the 7-day weekly family.
 fn claude_window_minutes(label: &str) -> Option<i64> {
-    Some(if label.eq_ignore_ascii_case("Session") { 300 } else { 10_080 })
+    Some(if label.eq_ignore_ascii_case("5h") { 300 } else { 10_080 })
 }
 
 fn role(window: Option<&CodexWindow>) -> Option<&'static str> {
@@ -1954,6 +2035,18 @@ fn role(window: Option<&CodexWindow>) -> Option<&'static str> {
         18_000 => Some("session"),
         604_800 => Some("weekly"),
         _ => None,
+    }
+}
+
+/// Bucket a Codex window into the shared label family by its reported length:
+/// ≤6h reads as the "5h" bucket, up to ~10 days as "Weekly", anything longer
+/// as "Monthly". Windows without a reported length keep the slot fallback.
+fn codex_duration_label(window: &CodexWindow, fallback: &str) -> String {
+    match window.limit_window_seconds {
+        s if s <= 0 => fallback.to_string(),
+        s if s <= 21_600 => "5h".to_string(),
+        s if s <= 907_200 => "Weekly".to_string(),
+        _ => "Monthly".to_string(),
     }
 }
 
@@ -2236,10 +2329,39 @@ mod tests {
         };
         let windows = codex_windows(Some(&rate_limit), None, now);
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].remaining_percent, 65.0);
+    }
+
+    /// ChatGPT Free reports a single 30-day window in the primary slot; the
+    /// label must follow the reported length, not the slot position.
+    #[test]
+    fn labels_codex_windows_by_duration_not_slot() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let rate_limit = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 100.0,
+                reset_at: 1_700_142_000,
+                limit_window_seconds: 43_200 * 60, // 30 days
+            }),
+            secondary_window: None,
+        };
+        let windows = codex_windows(Some(&rate_limit), None, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Monthly");
+        // Unreported length falls back to the slot label.
+        let unreported = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 1.0,
+                reset_at: 0,
+                limit_window_seconds: 0,
+            }),
+            secondary_window: None,
+        };
+        let windows = codex_windows(Some(&unreported), None, now);
+        assert_eq!(windows[0].label, "5h");
     }
 
     #[test]
@@ -2362,7 +2484,7 @@ mod tests {
         };
         let windows = claude_windows(&usage, now);
         assert_eq!(windows.len(), 4);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 92.0);
         assert_eq!(windows[1].label, "Weekly");
         assert_eq!(windows[1].remaining_percent, 77.0);
@@ -2387,7 +2509,7 @@ mod tests {
         let windows = claude_windows(&usage, now);
         assert_eq!(
             windows.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(),
-            vec!["Session", "Weekly", "Sonnet", "Designs", "Daily Routines"]
+            vec!["5h", "Weekly", "Sonnet", "Designs", "Daily Routines"]
         );
     }
 
@@ -2413,7 +2535,7 @@ mod tests {
         ]);
         let windows = parse_unified_ratelimit_windows(&headers, now);
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
         assert!((windows[0].used_percent - 11.0).abs() < 1e-9);
         assert!((windows[0].remaining_percent - 89.0).abs() < 1e-9);
         assert_eq!(windows[0].window_minutes, Some(300));
@@ -2446,7 +2568,7 @@ mod tests {
             now,
         );
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].label, "5h");
 
         // unparseable 5h + valid 7d -> just Weekly
         let windows = parse_unified_ratelimit_windows(
@@ -2478,7 +2600,7 @@ mod tests {
         assert!((over.used_percent - 100.0).abs() < 1e-9);
         assert!((over.remaining_percent - 0.0).abs() < 1e-9);
         // None utilization -> no window
-        assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
+        assert!(unified_ratelimit_window("5h", None, Some(1_783_111_200), now).is_none());
     }
 
     #[test]

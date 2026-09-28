@@ -1,0 +1,198 @@
+<!-- Captured from ollama.com/settings (2026-07-16), de-identified. Free-tier account, both windows at 0%. Fixture for agent_ollama parse_settings_usage regression. -->
+text-xl font-medium flex items-center space-x-2">
+    <span>Cloud usage</span>
+    <span
+      class="text-xs font-normal px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-600 capitalize"
+      >free</span
+    >
+  </h2>
+  
+  <p class="text-xs text-neutral-500 mb-4">
+    Cloud models and capabilities such as web search contribute to session and
+    weekly limits.
+    
+    <a href="/pricing" class="text-black underline underline-offset-2">Upgrade</a> for
+    higher limits.
+    
+  </p>
+  
+  
+  
+  <div>
+    <div class="flex justify-between mb-2">
+      <span class="text-sm ">Session usage</span>
+      <span class="text-sm ">
+        0% used
+      </span>
+    </div>
+    <div class="relative group" data-usage-meter>
+      <div
+        class="absolute bottom-6 left-[var(--usage-bubble-x,50%)] z-10 inline-flex max-w-[min(260px,100%)] -translate-x-1/2 flex-col items-start gap-0.5 rounded-xl border border-neutral-300 bg-white/95 px-2.5 pt-[7px] pb-2 text-neutral-900 opacity-0 pointer-events-none whitespace-nowrap backdrop-blur-md group-[.usage-meter--active]:opacity-100"
+        data-usage-bubble
+        aria-hidden="true"
+      >
+        <span class="max-w-[190px] overflow-hidden text-ellipsis text-xs font-medium leading-[1.2]" data-usage-model></span>
+        <span class="text-[11px] leading-[1.2] text-neutral-500" data-usage-requests></span>
+      </div>
+      <div
+        class="relative h-3 overflow-hidden rounded-full bg-neutral-200"
+        data-usage-track
+        aria-label="Session usage 0% used"
+      >
+        <div
+          class="flex h-full overflow-hidden bg-neutral-950"
+          style="width: 0%; "
+        >
+          
+          
+          
+        </div>
+      </div>
+    </div>
+    
+    
+    <div
+      class="text-xs text-neutral-500 mt-1 local-time"
+      data-time="2026-07-16T15:00:00Z"
+    >
+      Resets in 2 hours.
+    </div>
+    
+  </div>
+
+  <div>
+    <div class="flex justify-between mb-2">
+      <span class="text-sm">Weekly usage</span>
+      <span class="text-sm "
+        >0% used</span
+      >
+    </div>
+    <div class="relative group" data-usage-meter>
+      <div
+        class="absolute bottom-6 left-[var(--usage-bubble-x,50%)] z-10 inline-flex max-w-[min(260px,100%)] -translate-x-1/2 flex-col items-start gap-0.5 rounded-xl border border-neutral-300 bg-white/95 px-2.5 pt-[7px] pb-2 text-neutral-900 opacity-0 pointer-events-none whitespace-nowrap backdrop-blur-md group-[.usage-meter--active]:opacity-100"
+        data-usage-bubble
+        aria-hidden="true"
+      >
+        <span class="max-w-[190px] overflow-hidden text-ellipsis text-xs font-medium leading-[1.2]" data-usage-model></span>
+        <span class="text-[11px] leading-[1.2] text-neutral-500" data-usage-requests></span>
+      </div>
+      <div
+        class="relative h-3 overflow-hidden rounded-full bg-neutral-200"
+        data-usage-track
+        aria-label="Weekly usage 0% used"
+      >
+        <div
+          class="flex h-full overflow-hidden bg-neutral-950"
+          style="width: 0%"
+        >
+          
+          
+          
+        </div>
+      </div>
+    </div>
+    
+    <div
+      class="text-xs text-neutral-500 mt-1 local-time"
+      data-time="2026-07-20T00:00:00Z"
+    >
+      Resets in 3 days.
+    </div>
+  </div>
+
+  <script>
+    document.querySelectorAll(".local-time").forEach(function (el) {
+      var iso = el.dataset.time;
+      if (iso) {
+        var d = new Date(iso);
+        el.title = d.toLocaleString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        });
+      }
+    });
+
+    document.querySelectorAll("[data-usage-meter]").forEach(function (meter) {
+      var bubble = meter.querySelector("[data-usage-bubble]");
+      var model = meter.querySelector("[data-usage-model]");
+      var requests = meter.querySelector("[data-usage-requests]");
+      var segments = meter.querySelectorAll("[data-usage-segment]");
+
+      if (!bubble || !model || !requests || segments.length === 0) {
+        return;
+      }
+
+      function requestLabel(count) {
+        return count === "1" ? "1 request" : count + " requests";
+      }
+
+      function placeBubble(segment) {
+        var meterRect = meter.getBoundingClientRect();
+        var segmentRect = segment.getBoundingClientRect();
+        var bubbleRect = bubble.getBoundingClientRect();
+        var center = segmentRect.left + segmentRect.width / 2 - meterRect.left;
+        var padding = 8;
+        var minX = bubbleRect.width / 2 + padding;
+        var maxX = meterRect.width - bubbleRect.width / 2 - padding;
+        var x =
+          maxX < minX
+            ? meterRect.width / 2
+            : Math.max(minX, Math.min(center, maxX));
+
+        meter.style.setProperty("--usage-bubble-x", x + "px");
+      }
+
+      function showSegment(segment) {
+        var count = segment.dataset.requests || "0";
+
+        model.textContent = segment.dataset.model || "";
+        requests.textContent = requestLabel(count);
+        segments.forEach(function (item) {
+          item.classList.remove("is-active");
+        });
+        segment.classList.add("is-active");
+        meter.classList.add("usage-meter--active");
+        requestAnimationFrame(function () {
+          placeBubble(segment);
+        });
+      }
+
+      function hideSegment() {
+        meter.classList.remove("usage-meter--active");
+        segments.forEach(function (item) {
+          item.classList.remove("is-active");
+        });
+      }
+
+      segments.forEach(function (segment) {
+        segment.addEventListener("pointerenter", function () {
+          showSegment(segment);
+        });
+        segment.addEventListener("pointermove", function () {
+          placeBubble(segment);
+        });
+        segment.addEventListener("focus", function () {
+          showSegment(segment);
+        });
+        segment.addEventListener("blur", hideSegment);
+      });
+
+      meter.addEventListener("pointerleave", hideSegment);
+    });
+  </script>
+  
+
+  
+  <form method="POST" action="/settings" class="pt-2" hx-post="/settings" hx-swap="none">
+    <label class="flex items-center gap-2 text-xs text-neutral-700">
+      <input
+        type="checkbox"
+        name="notify-usage-limits"
+        class="rounded border-neutral-300"
+        onchange="this.form.requestSubmit()"
+        checked
+      />
+      <span>Notify me when I'm close to hitting my u

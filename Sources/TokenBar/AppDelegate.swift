@@ -56,6 +56,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         animator.onQuotaUpdated = { [weak self] in self?.applyTitle() }
         animator.start()
         startTitleRefresh()
+        // Remote-machine mirrors sync hourly; the first sync of a fresh
+        // machine happens immediately on launch.
+        if !CommandLine.arguments.contains("--demo") {
+            RemoteMachineStore.shared.startScheduler()
+        }
 
         // Re-render the title the moment any setting changes (tray mode, quota
         // source) — cheap, recomputes from cached data. The refresh LOOP is
@@ -108,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         titleRefreshTask?.cancel()
+        RemoteMachineStore.shared.stopScheduler()
         trayAnimator?.stop()
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
         // Remove the status item / close the popover so ControlCenter tears

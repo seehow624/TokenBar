@@ -27,6 +27,55 @@ pub struct ModelPricing {
     pub cache_read_input_token_cost_above_272k_tokens: Option<f64>,
 }
 
+impl ModelPricing {
+    /// Every rate this row can carry, base rates and long-context tiers alike,
+    /// as one list.
+    ///
+    /// The destructure below deliberately carries no `..` rest pattern: adding
+    /// a field to `ModelPricing` breaks this function at compile time and
+    /// forces the new rate into every predicate that reasons over *all* rates.
+    /// Leaving that to a comment is not safe enough for
+    /// `quotes_zero_for_every_published_rate`, where an overlooked rate is
+    /// treated as zero and a new paid tier would read as free.
+    pub(crate) fn all_rates(&self) -> [Option<f64>; 15] {
+        let Self {
+            input_cost_per_token,
+            input_cost_per_token_above_128k_tokens,
+            input_cost_per_token_above_200k_tokens,
+            input_cost_per_token_above_256k_tokens,
+            input_cost_per_token_above_272k_tokens,
+            output_cost_per_token,
+            output_cost_per_token_above_128k_tokens,
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token_above_256k_tokens,
+            output_cost_per_token_above_272k_tokens,
+            cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost,
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost_above_272k_tokens,
+        } = *self;
+
+        [
+            input_cost_per_token,
+            input_cost_per_token_above_128k_tokens,
+            input_cost_per_token_above_200k_tokens,
+            input_cost_per_token_above_256k_tokens,
+            input_cost_per_token_above_272k_tokens,
+            output_cost_per_token,
+            output_cost_per_token_above_128k_tokens,
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token_above_256k_tokens,
+            output_cost_per_token_above_272k_tokens,
+            cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost,
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost_above_272k_tokens,
+        ]
+    }
+}
+
 pub type PricingDataset = HashMap<String, ModelPricing>;
 
 pub fn load_cached() -> Option<PricingDataset> {

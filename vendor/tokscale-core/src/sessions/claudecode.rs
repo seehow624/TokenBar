@@ -487,6 +487,11 @@ pub fn parse_claude_file_with_cache_and_home(
     let mut pending_request_start_timestamp_ms: Option<i64> = None;
     let mut last_model: Option<String> = None;
     let mut last_provider_hint: Option<String> = None;
+    // Claude Code writes local API-error and auth notices as assistant messages
+    // with `<synthetic>` rather than an API model. A following tool result has
+    // no model of its own, so it must not inherit that placeholder and turn a
+    // char estimate into unpriceable usage.
+    let mut suppress_unattributed_tool_results = false;
     // Sidechain detection state (resolved lazily on first parseable entry)
     let mut sidechain_agent: Option<String> = None;
     let mut sidechain_detected = false;
@@ -538,6 +543,8 @@ pub fn parse_claude_file_with_cache_and_home(
                         workspace_key: workspace_key.clone(),
                         workspace_label: workspace_label.clone(),
                         sidechain_agent: sidechain_agent.clone(),
+                        suppress_unattributed: suppress_unattributed_tool_results,
+                        allow_char_estimate: false,
                     },
                 );
 
@@ -611,7 +618,6 @@ pub fn parse_claude_file_with_cache_and_home(
                                 &mut messages[existing_idx],
                                 &usage,
                                 parse_claude_entry_timestamp(entry.timestamp.as_deref()),
-                                pending_request_start_timestamp_ms,
                             );
                             if let Some(choice) = duplicate_provider_choice {
                                 update_claude_provider_id(
@@ -631,7 +637,6 @@ pub fn parse_claude_file_with_cache_and_home(
                                 &mut messages[existing_idx],
                                 &usage,
                                 parse_claude_entry_timestamp(entry.timestamp.as_deref()),
-                                pending_request_start_timestamp_ms,
                             );
                             if let Some(choice) = duplicate_provider_choice {
                                 update_claude_provider_id(
@@ -652,8 +657,17 @@ pub fn parse_claude_file_with_cache_and_home(
                     None => continue,
                 };
                 if is_synthetic_placeholder_model(&raw_model) {
+                    // The placeholder is dropped, and the following tool result
+                    // must not inherit it (or the previously-seen model) as an
+                    // attribution that would turn a char estimate into
+                    // unpriceable usage.
+                    last_model = None;
+                    last_provider_hint = None;
+                    pending_request_start_timestamp_ms = None;
+                    suppress_unattributed_tool_results = true;
                     continue;
                 }
+                suppress_unattributed_tool_results = false;
                 let provider_choice = claude_provider_choice(
                     &raw_model,
                     message
@@ -666,7 +680,8 @@ pub fn parse_claude_file_with_cache_and_home(
                 let model = canonicalize_claude_model(&raw_model);
 
                 let parsed_timestamp = parse_claude_entry_timestamp(entry.timestamp.as_deref());
-                let timestamp = parsed_timestamp.unwrap_or(fallback_timestamp);
+                let timestamp = pending_request_start_timestamp_ms
+                    .unwrap_or_else(|| parsed_timestamp.unwrap_or(fallback_timestamp));
                 let duration_ms =
                     duration_between_ms(pending_request_start_timestamp_ms, parsed_timestamp);
 
@@ -868,7 +883,6 @@ fn merge_claude_duplicate(
     existing: &mut UnifiedMessage,
     usage: &ClaudeUsage,
     parsed_timestamp: Option<i64>,
-    request_start_timestamp_ms: Option<i64>,
 ) {
     // Per-field max merge: each token field is updated independently.
     let t = &mut existing.tokens;
@@ -883,21 +897,13 @@ fn merge_claude_duplicate(
 
     if let Some(timestamp_ms) = parsed_timestamp {
         if timestamp_ms >= existing.timestamp {
-            // Recover the original request-start timestamp from the existing
-            // message's recorded duration. The parent loop clears
-            // `pending_request_start_timestamp_ms` after the first chunk of a
-            // message commits (so a NEW message with no preceding user doesn't
-            // inflate by reusing a stale start), which would otherwise blank
-            // out streaming duplicates' duration. Recovering from
-            // `existing.timestamp - existing.duration_ms` keeps the duration
-            // honest for late chunks of the same logical message.
-            let recovered_start = existing
-                .duration_ms
-                .map(|d| existing.timestamp - d)
-                .or(request_start_timestamp_ms);
-            existing.set_timestamp(timestamp_ms);
-            if let Some(new_duration) = duration_between_ms(recovered_start, Some(timestamp_ms)) {
-                existing.duration_ms = Some(new_duration);
+            let new_duration = timestamp_ms.saturating_sub(existing.timestamp);
+            if new_duration > 0 {
+                // Duplicates can arrive out of order (e.g. late-processed
+                // streaming chunks), so never let a later-processed duplicate
+                // with an earlier completion timestamp shrink a duration
+                // already established by another duplicate.
+                existing.duration_ms = Some(existing.duration_ms.unwrap_or(0).max(new_duration));
             }
         }
     }
@@ -930,6 +936,14 @@ struct ClaudeToolResultContext<'a> {
     workspace_key: Option<String>,
     workspace_label: Option<String>,
     sidechain_agent: Option<String>,
+    /// A preceding local Claude Code notice used `<synthetic>` instead of an API
+    /// model. A following tool result with no model cannot be attributed safely.
+    suppress_unattributed: bool,
+    /// Whether char-based token estimation may be used as a fallback when no
+    /// explicit tool-result token count is present. Nothing sets it true: the
+    /// next assistant turn's usage already covers the same text, so an
+    /// estimate counts it twice. The flag stays to match upstream's shape.
+    allow_char_estimate: bool,
 }
 
 fn extract_claude_tool_result_message(
@@ -937,21 +951,15 @@ fn extract_claude_tool_result_message(
     context: ClaudeToolResultContext<'_>,
 ) -> Option<UnifiedMessage> {
     let value: Value = serde_json::from_str(line).ok()?;
-    let usage = extract_claude_tool_result_usage(&value)?;
+    let usage = extract_claude_tool_result_usage(&value, context.allow_char_estimate)?;
 
-    let raw_model = extract_claude_model(&value)
-        .or_else(|| {
-            context
-                .entry
-                .message
-                .as_ref()
-                .and_then(|message| message.model.clone())
-        })
-        .or_else(|| context.last_model.map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string());
-    if is_synthetic_placeholder_model(&raw_model) {
-        return None;
-    }
+    let explicit_model = extract_claude_model(&value).or_else(|| {
+        context
+            .entry
+            .message
+            .as_ref()
+            .and_then(|message| message.model.clone())
+    });
     let provider_hint = extract_claude_provider(&value)
         .or_else(|| {
             context
@@ -960,7 +968,20 @@ fn extract_claude_tool_result_message(
                 .as_ref()
                 .and_then(|message| message.provider_id.clone())
         })
-        .or_else(|| context.entry.provider_id.clone())
+        .or_else(|| context.entry.provider_id.clone());
+    let raw_model = match explicit_model {
+        Some(model) if is_synthetic_placeholder_model(&model) => return None,
+        Some(model) => model,
+        // A provider alone cannot identify a billable model. Suppress every
+        // model-less result after a local synthetic notice rather than emit
+        // another unpriceable `provider/unknown` estimate.
+        None if context.suppress_unattributed => return None,
+        None => context
+            .last_model
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
+    let provider_hint = provider_hint
         .or_else(|| context.last_provider_hint.map(str::to_string))
         .or_else(|| context.default_provider_hint.map(str::to_string));
 
@@ -997,7 +1018,10 @@ fn extract_claude_tool_result_message(
     Some(message)
 }
 
-fn extract_claude_tool_result_usage(value: &Value) -> Option<ClaudeToolResultUsage> {
+fn extract_claude_tool_result_usage(
+    value: &Value,
+    allow_char_estimate: bool,
+) -> Option<ClaudeToolResultUsage> {
     let mut total_tokens = 0;
     let mut first_dedup_id: Option<String> = None;
     let mut seen_ids = HashSet::new();
@@ -1012,7 +1036,8 @@ fn extract_claude_tool_result_usage(value: &Value) -> Option<ClaudeToolResultUsa
         if first_dedup_id.is_none() {
             first_dedup_id = tool_result_id;
         }
-        total_tokens += extract_tool_result_input_tokens(tool_result).unwrap_or(0);
+        total_tokens +=
+            extract_tool_result_input_tokens(tool_result, allow_char_estimate).unwrap_or(0);
     }
 
     if total_tokens <= 0 {
@@ -1078,8 +1103,11 @@ fn extract_tool_result_id(tool_result: &Value) -> Option<String> {
         .or_else(|| extract_string(tool_result.get("tool_result_id")))
 }
 
-fn extract_tool_result_input_tokens(tool_result: &Value) -> Option<i64> {
+fn extract_tool_result_input_tokens(tool_result: &Value, allow_char_estimate: bool) -> Option<i64> {
     explicit_tool_result_input_tokens(tool_result).or_else(|| {
+        if !allow_char_estimate {
+            return None;
+        }
         let chars = tool_result_output_char_count(tool_result);
         (chars > 0).then(|| estimate_tokens_from_chars(chars))
     })
@@ -1179,7 +1207,7 @@ fn canonicalize_claude_model(model: &str) -> String {
 /// (cancelled requests, injected continuations) — these never hit a real model,
 /// carry no real cost, and only show up as a phantom zero-token row. Drop them.
 fn is_synthetic_placeholder_model(model: &str) -> bool {
-    model.trim() == "<synthetic>"
+    model.trim().eq_ignore_ascii_case("<synthetic>")
 }
 
 #[derive(Default)]
@@ -1191,6 +1219,10 @@ struct ClaudeHeadlessState {
     cache_read: i64,
     cache_write: i64,
     timestamp_ms: Option<i64>,
+    /// A local Claude Code notice uses `<synthetic>` as its model. Ignore all
+    /// stream deltas until its matching stop event so they cannot leak into the
+    /// next real response.
+    skipping_synthetic_stream: bool,
 }
 
 fn parse_claude_headless_json(
@@ -1244,6 +1276,11 @@ fn process_claude_headless_line(
 
     match event_type {
         "message_start" => {
+            if state.skipping_synthetic_stream {
+                // A new start without a stop means the synthetic stream was
+                // truncated. Its deltas must not survive into the new stream.
+                *state = ClaudeHeadlessState::default();
+            }
             completed_message = finalize_headless_state(
                 state,
                 session_id,
@@ -1252,7 +1289,13 @@ fn process_claude_headless_line(
                 default_provider_hint,
             );
 
-            state.model = extract_claude_model(&value);
+            let model = extract_claude_model(&value);
+            if model.as_deref().is_some_and(is_synthetic_placeholder_model) {
+                *state = ClaudeHeadlessState::default();
+                state.skipping_synthetic_stream = true;
+                return completed_message;
+            }
+            state.model = model;
             state.provider_id = extract_claude_provider(&value);
             state.timestamp_ms = extract_claude_timestamp(&value).or(state.timestamp_ms);
             if let Some(usage) = value
@@ -1264,6 +1307,9 @@ fn process_claude_headless_line(
             }
         }
         "message_delta" => {
+            if state.skipping_synthetic_stream {
+                return None;
+            }
             if let Some(usage) = value
                 .get("usage")
                 .or_else(|| value.get("delta").and_then(|delta| delta.get("usage")))
@@ -1272,6 +1318,10 @@ fn process_claude_headless_line(
             }
         }
         "message_stop" => {
+            if state.skipping_synthetic_stream {
+                *state = ClaudeHeadlessState::default();
+                return None;
+            }
             completed_message = finalize_headless_state(
                 state,
                 session_id,
@@ -1536,6 +1586,10 @@ fn finalize_headless_state(
 ) -> Option<UnifiedMessage> {
     let raw_model = state.model.clone()?;
     if is_synthetic_placeholder_model(&raw_model) {
+        *state = ClaudeHeadlessState::default();
+        return None;
+    }
+    if state.skipping_synthetic_stream {
         *state = ClaudeHeadlessState::default();
         return None;
     }
@@ -1904,9 +1958,49 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.output, 250);
-        assert_eq!(messages[0].timestamp, 1_733_047_203_500);
+        assert_eq!(messages[0].timestamp, 1_733_047_200_000);
         assert_eq!(messages[0].duration_ms, Some(3500));
         assert_eq!(messages[0].dedup_key.as_deref(), Some("message:msg_stream"));
+    }
+
+    #[test]
+    fn test_dedup_merge_duration_is_monotonic_across_out_of_order_duplicates() {
+        // Regression: several streaming duplicates of one message can be
+        // processed out of order (e.g. a late-arriving chunk carrying an
+        // earlier completion timestamp than one already merged). The start
+        // anchor (existing.timestamp) must survive every merge, and
+        // duration_ms must never shrink below a value already established by
+        // an earlier-processed duplicate — it must track the latest
+        // (largest) end timestamp seen so far.
+        let content = r#"{"type":"user","timestamp":"2024-12-01T10:00:00.000Z","message":{"content":"Hello"}}
+{"type":"assistant","timestamp":"2024-12-01T10:00:01.000Z","requestId":"req_multi","message":{"id":"msg_multi","model":"claude-3-5-sonnet","usage":{"input_tokens":10,"output_tokens":30}}}
+{"type":"assistant","timestamp":"2024-12-01T10:00:05.000Z","requestId":"req_multi","message":{"id":"msg_multi","model":"claude-3-5-sonnet","usage":{"input_tokens":10,"output_tokens":100}}}
+{"type":"assistant","timestamp":"2024-12-01T10:00:02.000Z","requestId":"req_multi","message":{"id":"msg_multi","model":"claude-3-5-sonnet","usage":{"input_tokens":10,"output_tokens":50}}}
+{"type":"assistant","timestamp":"2024-12-01T10:00:07.000Z","requestId":"req_multi","message":{"id":"msg_multi","model":"claude-3-5-sonnet","usage":{"input_tokens":10,"output_tokens":200}}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "all streaming duplicates should collapse to one message"
+        );
+        assert_eq!(
+            messages[0].timestamp, 1_733_047_200_000,
+            "the start anchor must survive every merge (the user entry's timestamp)"
+        );
+        assert_eq!(
+            messages[0].duration_ms,
+            Some(7_000),
+            "duration_ms must equal the latest end timestamp minus the start \
+             anchor (7s), not shrink when an out-of-order duplicate with an \
+             earlier timestamp is merged"
+        );
+        assert_eq!(
+            messages[0].tokens.output, 200,
+            "token fields keep the per-field max across all duplicates"
+        );
     }
 
     #[test]
@@ -1980,8 +2074,8 @@ mod tests {
 
         assert_eq!(
             messages.len(),
-            4,
-            "Should include 3 assistant messages plus 1 tool-result input message"
+            3,
+            "Should include 3 assistant messages; the tool_result carries no explicit tokens"
         );
         let assistant_messages: Vec<_> = messages
             .iter()
@@ -2068,28 +2162,16 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_output_counts_as_input() {
+    fn test_tool_result_without_explicit_tokens_is_not_counted() {
         let content = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"anthropic/claude-4-6-sonnet","content":[{"type":"tool_result","tool_use_id":"toolu_input","tool_output":{"output":"abcdefghijklmnop"}}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
-        assert_eq!(messages[0].provider_id, "anthropic");
-        assert_eq!(messages[0].tokens.input, 4);
-        assert_eq!(messages[0].tokens.output, 0);
-        assert_eq!(messages[0].tokens.cache_read, 0);
-        assert_eq!(messages[0].tokens.cache_write, 0);
-        let expected_dedup_key = format!(
-            "claude:tool_result:{}:tool_result:toolu_input",
-            messages[0].session_id
+        assert!(
+            messages.is_empty(),
+            "the next assistant turn's usage already covers this text"
         );
-        assert_eq!(
-            messages[0].dedup_key.as_deref(),
-            Some(expected_dedup_key.as_str())
-        );
-        assert_eq!(messages[0].message_count, 0);
     }
 
     #[test]
@@ -2115,21 +2197,22 @@ mod tests {
 
     #[test]
     fn test_tool_result_duplicate_uses_max_input_tokens() {
-        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnop"}}}
-{"type":"tool_result","timestamp":"2026-05-27T10:00:00.100Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd"}}}"#;
+        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}}}
+{"type":"tool_result","timestamp":"2026-05-27T10:00:00.100Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd","input_tokens":8}}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].provider_id, "anthropic");
         assert_eq!(messages[0].tokens.input, 8);
         assert_eq!(messages[0].timestamp, 1_779_876_000_100);
     }
 
     #[test]
     fn test_tool_result_repeated_in_same_record_is_not_counted_twice() {
-        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop"}},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop"}}]}}"#;
+        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
@@ -2139,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_prefers_input_token_metadata_over_char_estimate() {
+    fn test_tool_result_with_explicit_token_metadata_is_counted() {
         let content = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"claude-sonnet-4-6","content":[{"type":"tool_result","tool_use_id":"toolu_metadata","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd","input_tokens":3}}]}}"#;
 
         let file = create_test_file(content);
@@ -2147,6 +2230,16 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 3);
+        assert_eq!(messages[0].tokens.output, 0);
+        let expected_dedup_key = format!(
+            "claude:tool_result:{}:tool_result:toolu_metadata",
+            messages[0].session_id
+        );
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some(expected_dedup_key.as_str())
+        );
+        assert_eq!(messages[0].message_count, 0);
     }
 
     #[test]
@@ -2203,6 +2296,77 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn test_synthetic_notice_does_not_seed_an_unmodelled_tool_result() {
+        let content = r#"{"type":"user","timestamp":"2026-06-24T01:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","isApiErrorMessage":true,"error":"unknown","message":{"id":"m1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"API Error"}]}}
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"XXXXXXXXXXXXXXXX"}]}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_synthetic_notice_does_not_hide_an_explicitly_modelled_tool_result() {
+        let content = r#"{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","message":{"model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","message":{"model":"claude-sonnet-4-6","content":[{"tool_use_id":"toolu_1","type":"tool_result","input_tokens":4,"content":"XXXXXXXXXXXXXXXX"}]}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].tokens.input, 4);
+    }
+
+    #[test]
+    fn test_synthetic_notice_does_not_emit_a_provider_only_tool_result() {
+        let content = r#"{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","message":{"model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","provider":"openrouter","message":{"content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"XXXXXXXXXXXXXXXX"}]}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_headless_synthetic_stream_deltas_do_not_leak_into_next_response() {
+        let content = r#"{"type":"message_start","timestamp":"2026-06-24T01:00:00Z","message":{"model":"<synthetic>","usage":{"input_tokens":0}}}
+{"type":"message_delta","usage":{"output_tokens":999,"cache_read_input_tokens":888}}
+{"type":"message_stop"}
+{"type":"message_start","timestamp":"2026-06-24T01:00:02Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_read_input_tokens":2}}}
+{"type":"message_delta","usage":{"output_tokens":3}}
+{"type":"message_stop"}"#;
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.cache_read, 2);
+    }
+
+    #[test]
+    fn test_truncated_headless_synthetic_stream_does_not_leak_into_next_response() {
+        let content = r#"{"type":"message_start","timestamp":"2026-06-24T01:00:00Z","message":{"model":"<synthetic>","usage":{"input_tokens":0}}}
+{"type":"message_delta","usage":{"output_tokens":999,"cache_read_input_tokens":888}}
+{"type":"message_start","timestamp":"2026-06-24T01:00:02Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_read_input_tokens":2}}}
+{"type":"message_delta","usage":{"output_tokens":3}}
+{"type":"message_stop"}"#;
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.cache_read, 2);
     }
 
     #[test]
@@ -2363,6 +2527,76 @@ mod tests {
             messages.is_empty(),
             "wrapper transcripts without usage metadata must not be estimated"
         );
+    }
+
+    #[test]
+    fn test_bare_transcript_with_tool_outputs_is_not_estimated() {
+        let content = r#"{"type":"tool_use","timestamp":"2026-04-01T10:00:00.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}
+{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"},"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}
+{"type":"tool_use","timestamp":"2026-04-01T10:00:02.000Z","tool_name":"bash","tool_input":{"command":"cargo build"}}
+{"type":"tool_result","timestamp":"2026-04-01T10:00:03.000Z","tool_name":"bash","tool_input":{"command":"cargo build"},"tool_output":{"output":"   Compiling myproject v0.1.0\n    Finished dev [unoptimized + debuginfo] target(s) in 2.34s\n"}}"#;
+        let (_dir, path) = create_transcript_file(content, "ses_aabbccdd11223344556677889.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert!(
+            messages.is_empty(),
+            "bare transcripts with only tool outputs must not produce estimated token messages"
+        );
+    }
+
+    #[test]
+    fn test_project_transcript_with_tool_outputs_is_not_estimated() {
+        let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":[{"type":"text","text":"fn main() { println!(\"hello\"); }"}]}]}}"#;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject")
+            .join("ses_project123.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+
+        let messages = parse_claude_file(&path);
+
+        assert!(
+            messages.is_empty(),
+            "the assistant turn that follows already bills this content"
+        );
+    }
+
+    #[test]
+    fn test_reported_input_is_not_inflated_by_tool_result_text() {
+        // A real transcript's shape: no metadata on the tool result, and the
+        // next turn reporting that text under cache_creation_input_tokens.
+        let content = r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":"fn main() { println!(\"hello\"); }"}]}}
+{"type":"assistant","timestamp":"2026-04-01T10:00:01.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"cache_creation_input_tokens":1551,"cache_read_input_tokens":88518,"output_tokens":367}}}"#;
+        let (_dir, path) = create_project_file(content, "myproject", "ses_inflation1122.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 2);
+        assert_eq!(messages[0].tokens.cache_write, 1551);
+        assert_eq!(messages[0].tokens.cache_read, 88518);
+        assert_eq!(messages[0].tokens.output, 367);
+    }
+
+    #[test]
+    fn test_bare_transcript_with_explicit_tool_result_tokens_is_counted() {
+        // Nothing is char-estimated, but an explicit count is still honored.
+        let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","input_tokens":42,"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
+        let (_dir, path) = create_transcript_file(content, "ses_explicit112233445566778899.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "bare transcripts must still count explicit tool-result token usage"
+        );
+        assert_eq!(messages[0].tokens.input, 42);
     }
 
     // --- Sidechain / Agent tracking tests ---

@@ -46,10 +46,11 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "openrouter/",
 ];
 
-// Bare brand tokens ("claude", "anthropic") are blocked because they contain
-// no model information: a fuzzy hit from them can land on any model of the
-// brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
-// opus-fast key), so such a match is never trustworthy.
+// Bare brand tokens ("claude", "anthropic", "gemini") are blocked because they
+// contain no model information: a fuzzy hit from them can land on any model of
+// the brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
+// opus-fast key, or `gemini-default` eroding to `gemini` and landing on a
+// native-audio preview key), so such a match is never trustworthy.
 //
 // Generic English words ("model", "router") are blocked for the same reason:
 // they carry no model identity, yet substring-match real priced keys
@@ -64,6 +65,7 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "base",
     "claude",
     "anthropic",
+    "gemini",
     "model",
     "router",
 ];
@@ -73,6 +75,18 @@ const TIERED_PRICING_THRESHOLD_128K_TOKENS: f64 = 128_000.0;
 const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
 const TIERED_PRICING_THRESHOLD_256K_TOKENS: f64 = 256_000.0;
 const TIERED_PRICING_THRESHOLD_272K_TOKENS: f64 = 272_000.0;
+
+// Only these identities document one long-context rate tier for the whole
+// request. Other catalog `*_above_*` fields retain marginal semantics (each
+// field walks its own thresholds).
+const FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-2026-03-05",
+    "gpt-5.4-pro",
+    "gpt-5.4-pro-2026-03-05",
+    "gpt-5.5",
+    "gpt-5.5-2026-04-23",
+];
 
 const MIN_FUZZY_MATCH_LEN: usize = 5;
 
@@ -133,10 +147,14 @@ impl PricingLookup {
         cursor: HashMap<String, ModelPricing>,
     ) -> Self {
         let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
-        litellm_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        // Length first (longest key wins), then lexicographic. The secondary
+        // order makes equal-length fallback ties reproducible: without it a
+        // rebuilt catalog could keep HashMap iteration order and reprice
+        // identical historical usage with a different dated rate.
+        litellm_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut openrouter_keys: Vec<String> = openrouter.keys().cloned().collect();
-        openrouter_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        openrouter_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut litellm_lower = HashMap::with_capacity(litellm.len());
         for key in &litellm_keys {
@@ -283,6 +301,14 @@ impl PricingLookup {
 
         let lower_ref: &str = normalized_owned.as_deref().unwrap_or(&lower);
 
+        // Normalize the forced-source selector once, so LiteLLM/OpenRouter
+        // isolation is case-insensitive through the direct, exact, and
+        // fallback paths (`"LiteLLM"` used to fall through to automatic
+        // lookup). The `custom` selector is resolved by `PricingService`
+        // before this function runs.
+        let force_source_normalized = force_source.map(str::to_ascii_lowercase);
+        let force_source = force_source_normalized.as_deref();
+
         // Helper to perform lookup with the given source constraint
         let do_lookup = |id: &str| match force_source {
             Some("litellm") => self.lookup_litellm_only(id, provider_id),
@@ -318,6 +344,32 @@ impl PricingLookup {
         let guarded_lookup = |candidate: &str| {
             do_lookup(candidate).filter(|result| !unsafe_claude_resolution(result))
         };
+
+        // 1.5. Generic provider-routing prefix fallback: ids coming from a
+        // router/proxy (e.g. `cx/gpt-5.5` via an `omniroute` provider) carry a
+        // prefix outside the curated `PROVIDER_PREFIXES` list, so the
+        // known-prefix stripping inside `lookup_auto` never fires for them.
+        // The direct exact lookup above already had first crack at the full
+        // id, so a dataset key that legitimately keeps its prefix (e.g.
+        // `anthropic/claude-fable-5`) resolves there and never reaches this
+        // fallback. Only the terminal path segment is retried here, matching
+        // the `/`-scoped fallbacks already used by the Cursor/Sakana exact
+        // matchers.
+        if let Some(terminal) = strip_generic_provider_prefix(lower_ref) {
+            if let Some(result) = guarded_lookup(terminal) {
+                return Some(result);
+            }
+
+            // The terminal segment can still carry a tier suffix, and the two
+            // transformations have to compose here or they never meet: the
+            // suffix stage below only ever sees the prefixed id, and it splits
+            // on `-`, so it can peel `-xhigh` off `cx/gpt-5.5-xhigh` but is
+            // left with `cx/gpt-5.5`, which is not a dataset key either. Both
+            // halves resolve alone while the combination billed $0 (#846).
+            if let Some(result) = try_strip_unknown_suffix(terminal, guarded_lookup) {
+                return Some(result);
+            }
+        }
 
         // 2. Try stripping unknown suffixes (e.g., -thinking, -high, -codex)
         if let Some(result) = try_strip_unknown_suffix(lower_ref, guarded_lookup) {
@@ -858,6 +910,17 @@ impl PricingLookup {
             None => return 0.0,
         };
 
+        if uses_full_session_long_context_tier(&result) {
+            return compute_full_session_long_context_cost(
+                &result.pricing,
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.reasoning,
+            );
+        }
+
         compute_cost(
             &result.pricing,
             usage.input,
@@ -867,6 +930,76 @@ impl PricingLookup {
             usage.reasoning,
         )
     }
+}
+
+/// Whether this lookup result prices the request as one long-context tier.
+///
+/// Upstream `#846`/M18: a handful of LiteLLM identities document a single
+/// above-272k rate that applies to the *whole request* once
+/// `input + cache_read` crosses the threshold, rather than per field. Sakana's
+/// own catalog dimension is not vendored here, so only the LiteLLM identities
+/// gate this path.
+fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
+    let terminal_model_id = result
+        .matched_key
+        .rsplit('/')
+        .next()
+        .unwrap_or(result.matched_key.as_str());
+    result.source.eq_ignore_ascii_case("LiteLLM")
+        && FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
+            .iter()
+            .any(|key| terminal_model_id.eq_ignore_ascii_case(key))
+}
+
+/// Whole-request long-context pricing: the 272k tier is selected once for the
+/// request (by `input + cache_read`) and then applied to input, output, and
+/// cache-read alike. Cache-write is an independently reported subset and does
+/// not select the tier, matching the provider's documented behavior.
+fn compute_full_session_long_context_cost(
+    pricing: &ModelPricing,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+) -> f64 {
+    let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
+    let input_clamped = input.max(0) as f64;
+    let output_clamped = output.max(0).saturating_add(reasoning.max(0)) as f64;
+    let cache_read_clamped = cache_read.max(0) as f64;
+    let use_long_context_rates =
+        input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
+    let selected_price = |base: Option<f64>, long_context: Option<f64>| {
+        if use_long_context_rates {
+            safe_price(
+                long_context
+                    .filter(|value| is_valid_price_value(*value))
+                    .or(base),
+            )
+        } else {
+            safe_price(base)
+        }
+    };
+
+    let input_cost = input_clamped
+        * selected_price(
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_272k_tokens,
+        );
+    let output_cost = output_clamped
+        * selected_price(
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_272k_tokens,
+        );
+    let cache_read_cost = cache_read_clamped
+        * selected_price(
+            pricing.cache_read_input_token_cost,
+            pricing.cache_read_input_token_cost_above_272k_tokens,
+        );
+
+    let cache_write_cost = compute_cost(pricing, 0, 0, 0, cache_write, 0);
+
+    input_cost + output_cost + cache_read_cost + cache_write_cost
 }
 
 pub fn compute_cost(
@@ -958,9 +1091,11 @@ pub fn compute_cost(
     // because upstream LiteLLM does not currently declare 128k or 256k
     // cache-read pricing for any model. If upstream begins emitting
     // those keys, also add matching fields to `ModelPricing`,
-    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
-    // `has_meaningful_tier_support`; otherwise tier walks will silently
-    // undercost long-context cache reads on those models.
+    // `has_any_valid_above_tier_value`, and `has_meaningful_tier_support`;
+    // otherwise tier walks will silently undercost long-context cache reads
+    // on those models. `has_any_usable_pricing` needs no entry here: it reads
+    // `ModelPricing::all_rates`, whose exhaustive destructure fails to
+    // compile until the new field is added there.
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
@@ -1317,6 +1452,26 @@ fn strip_known_provider_prefix(model_id: &str) -> Option<&str> {
     None
 }
 
+/// Generic routing-prefix fallback for ids whose leading segment is not one
+/// of the curated `PROVIDER_PREFIXES` (e.g. `cx/gpt-5.5` routed through an
+/// `omniroute` proxy, or any other CLI/router-assigned alias). Returns the
+/// terminal path segment — the part after the last `/` — when the id
+/// actually contains a `/`, so `cx/gpt-5.5` resolves to `gpt-5.5`.
+///
+/// This is intentionally unconditional (unlike `strip_known_provider_prefix`,
+/// which only recognizes canonical LLM provider names): the caller only
+/// invokes it as a fallback AFTER the exact/direct lookup on the full id has
+/// already failed, so dataset keys that legitimately keep their prefix (e.g.
+/// `anthropic/claude-fable-5`) are resolved by their own exact key first and
+/// never reach this fallback.
+fn strip_generic_provider_prefix(model_id: &str) -> Option<&str> {
+    let terminal = model_id.rsplit('/').next()?;
+    if terminal.is_empty() || terminal == model_id {
+        return None;
+    }
+    Some(terminal)
+}
+
 fn is_valid_price_value(value: f64) -> bool {
     value.is_finite() && value >= 0.0
 }
@@ -1326,25 +1481,10 @@ fn is_valid_price_value(value: f64) -> bool {
 /// subscription-based providers like Perplexity) are useless for
 /// pay-per-token cost estimation and should be deprioritized.
 fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
-    [
-        pricing.input_cost_per_token,
-        pricing.output_cost_per_token,
-        pricing.cache_read_input_token_cost,
-        pricing.cache_creation_input_token_cost,
-        pricing.input_cost_per_token_above_128k_tokens,
-        pricing.input_cost_per_token_above_200k_tokens,
-        pricing.input_cost_per_token_above_256k_tokens,
-        pricing.input_cost_per_token_above_272k_tokens,
-        pricing.output_cost_per_token_above_128k_tokens,
-        pricing.output_cost_per_token_above_200k_tokens,
-        pricing.output_cost_per_token_above_256k_tokens,
-        pricing.output_cost_per_token_above_272k_tokens,
-        pricing.cache_read_input_token_cost_above_200k_tokens,
-        pricing.cache_read_input_token_cost_above_272k_tokens,
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
-    ]
-    .into_iter()
-    .any(|opt| opt.is_some_and(is_valid_price_value))
+    pricing
+        .all_rates()
+        .into_iter()
+        .any(|opt| opt.is_some_and(is_valid_price_value))
 }
 
 fn lookup_result_if_usable(
@@ -1900,6 +2040,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_gpt_5_5_uses_full_request_long_context_rates() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 270_540, 630, 7_936, 0, 0);
+        let expected = 270_540.0 * 0.000010 + 630.0 * 0.000045 + 7_936.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_provider_prefixed_gpt_5_5_uses_full_request_long_context_rates() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000001),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 271_999,
+            output: 3,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: 4,
+        };
+
+        let cost = lookup.calculate_cost_with_provider("openai/gpt-5.5", Some("openai"), &usage);
+        let expected = 271_999.0 * 0.000010 + 7.0 * 0.000045 + 2.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_threshold_includes_cache_read_and_reasoning() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 271_999, 3, 2, 0, 4);
+        let expected = 271_999.0 * 0.000010 + 7.0 * 0.000045 + 2.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_exact_threshold_stays_regular() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 272_000, 3, 0, 0, 4);
+        let expected = 272_000.0 * 0.000005 + 7.0 * 0.000030;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_cache_write_does_not_select_long_context() {
+        let lookup = create_lookup();
+        let without_cache_write = lookup.calculate_cost("gpt-5.5", 271_999, 10, 0, 0, 0);
+        let with_cache_write = lookup.calculate_cost("gpt-5.5", 271_999, 10, 0, 10_000, 0);
+        assert!((with_cache_write - without_cache_write).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_full_request_long_context_policy_is_identity_scoped() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(0.000005),
+            input_cost_per_token_above_272k_tokens: Some(0.000010),
+            ..Default::default()
+        };
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        // A provider-prefixed catalog key still matches on its terminal segment.
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "openai/gpt-5.5",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        // Other identities keep marginal tier semantics.
+        assert!(!uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.1",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        assert!(!uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5",
+            "OpenRouter",
+            pricing.clone()
+        )));
+        // An unlisted dated sibling is not covered.
+        assert!(!uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5-2026-01-01",
+            "LiteLLM",
+            pricing
+        )));
+    }
+
     // A provider-matched OpenRouter row that omits cache rates must not bill
     // cache tokens at $0 when a runner-up (LiteLLM) prices them: the winner
     // keeps its input/output but borrows the missing cache fields. This is the
@@ -2358,6 +2596,55 @@ mod tests {
 
     fn create_lookup() -> PricingLookup {
         PricingLookup::new(mock_litellm(), mock_openrouter(), HashMap::new())
+    }
+
+    /// Regression (#831): router/proxy-assigned ids like `cx/gpt-5.5` (seen
+    /// from OpenCode's `omniroute` provider) carry a prefix outside the
+    /// curated `PROVIDER_PREFIXES` list, so the pricing lookup used to return
+    /// `None` (and thus bill $0) instead of stripping the prefix and pricing
+    /// the underlying `gpt-5.5` model.
+    #[test]
+    fn test_unknown_prefixed_model_id_strips_to_underlying_model() {
+        let lookup = create_lookup();
+        let direct = lookup.lookup("gpt-5.5").unwrap();
+        let prefixed = lookup.lookup("cx/gpt-5.5").unwrap();
+        assert_eq!(prefixed.matched_key, direct.matched_key);
+        assert_eq!(prefixed.source, direct.source);
+        assert_eq!(
+            prefixed.pricing.input_cost_per_token,
+            direct.pricing.input_cost_per_token
+        );
+        assert_eq!(
+            prefixed.pricing.output_cost_per_token,
+            direct.pricing.output_cost_per_token
+        );
+    }
+
+    /// Regression (#846): an id carrying both a routing prefix and a tier
+    /// suffix resolved to nothing, so real usage billed $0. Each id below
+    /// resolves once one transformation is applied, but the two were never
+    /// applied together: prefix stripping only retried the terminal segment
+    /// as-is, and suffix stripping splits on `-`, so it never shed the `cx/`.
+    #[test]
+    fn test_routing_prefix_and_tier_suffix_strip_together() {
+        let lookup = create_lookup();
+        let expected = lookup.lookup("gpt-5.5").unwrap();
+
+        for id in [
+            "cx/gpt-5.5-xhigh",
+            "cx/gpt-5.5-high",
+            "cx/gpt-5.5-medium",
+            "cx/gpt-5.5-low",
+        ] {
+            let result = lookup
+                .lookup(id)
+                .unwrap_or_else(|| panic!("{id} must resolve"));
+            assert_eq!(result.matched_key, expected.matched_key, "id: {id}");
+            assert_eq!(
+                result.pricing.input_cost_per_token, expected.pricing.input_cost_per_token,
+                "id: {id}"
+            );
+        }
     }
 
     // =========================================================================

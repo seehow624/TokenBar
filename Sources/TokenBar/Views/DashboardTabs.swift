@@ -59,12 +59,22 @@ struct DashboardTabs: View {
             .foregroundStyle(active == id ? .primary : .secondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(
-                active == id ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear),
-                in: Capsule())
+            .background { pillBackground(active: active == id) }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .id(id)
+    }
+
+    /// Same selected-pill treatment as ViewSwitch (quaternary fill → macOS 26
+    /// interactive glass), just traced to this row's capsule shape.
+    @ViewBuilder private func pillBackground(active: Bool) -> some View {
+        if active {
+            if #available(macOS 26.0, *) {
+                Color.clear.glassEffect(.regular.interactive(), in: .capsule)
+            } else {
+                Capsule().fill(.quaternary)
+            }
+        }
     }
 }

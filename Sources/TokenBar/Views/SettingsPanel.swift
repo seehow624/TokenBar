@@ -21,7 +21,7 @@ struct SettingsPanel: View {
     /// Mirrors SMAppService's actual state (read once per panel appearance).
     @State private var autostartEnabled = AutostartService.isAvailable && AutostartService.isEnabled
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
-    @AppStorage("tokenbar.limits.asUsed") private var limitsAsUsed = false
+    @AppStorage("tokenbar.limits.asUsed") private var limitsAsUsed = true
     @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
     @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
     @AppStorage("tokenbar.trace.detailed") private var detailedTrace = false
@@ -301,6 +301,12 @@ struct SettingsPanel: View {
             section("Live trace") {
                 toggleRow("Split by agent / model", isOn: $detailedTrace)
                 hint("Affects the live-session card only: on, each agent & model gets its own row; off, rows collapse to one per app.")
+            }
+
+            if RemoteMachineStore.isFeatureAvailable {
+                section("Remote machines") {
+                    RemoteMachinesSection()
+                }
             }
 
             section("Popover size") {

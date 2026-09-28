@@ -79,6 +79,7 @@ struct PopoverView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            scanningBanner
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
@@ -96,10 +97,11 @@ struct PopoverView: View {
                 .padding(.bottom, 10)
             Divider()
             ScrollView {
-                content
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(OverlayScrollerEnforcer())
+                if #available(macOS 26.0, *) {
+                    GlassEffectContainer(spacing: 12) { dashboardContent }
+                } else {
+                    dashboardContent
+                }
             }
             .clipped()
             Divider()
@@ -187,6 +189,27 @@ struct PopoverView: View {
 
     // MARK: - Sections
 
+    /// Shown while a remote-machine scope is refreshing. Remote mirrors are
+    /// uncached, so re-scanning can take a couple of minutes — without a
+    /// prominent indicator the popover reads as frozen while the previous
+    /// data stays on screen.
+    @ViewBuilder private var scanningBanner: some View {
+        if model.refreshing, let scope = model.machineScope,
+           scope != DashboardModel.MachineScope.local {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Scanning \(scope == DashboardModel.MachineScope.combined ? "all machines" : scope)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.08))
+        }
+    }
+
     private var header: some View {
         HStack {
             BrandMark()
@@ -195,6 +218,7 @@ struct PopoverView: View {
                 .font(.headline)
             Spacer()
             liveRateBadge
+            machineMenu
             yearMenu
             refreshButton
         }
@@ -231,6 +255,51 @@ struct PopoverView: View {
             .menuIndicator(.visible)
             .fixedSize()
             .help("Filter usage by year")
+        }
+    }
+
+    /// Machine scope for every lens: this machine only, a named remote
+    /// mirror, or all machines combined. Shown only when at least one remote
+    /// mirror is configured.
+    @ViewBuilder private var machineMenu: some View {
+        let machines = RemoteMachineStore.shared.enabledMachines
+        if !machines.isEmpty {
+            Menu {
+                Picker("Machine", selection: Binding(
+                    get: { model.machineScope ?? DashboardModel.MachineScope.local },
+                    set: { value in
+                        Task { await model.setMachineScope(value) }
+                    }
+                )) {
+                    Text("This machine").tag(DashboardModel.MachineScope.local)
+                    Text("All machines").tag(DashboardModel.MachineScope.combined)
+                    Divider()
+                    ForEach(machines) { machine in
+                        Text(machine.name).tag(machine.name)
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "desktopcomputer")
+                    Text(machineScopeLabel)
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.visible)
+            .fixedSize()
+            .help("Show usage for this machine, a remote machine, or all machines")
+        }
+    }
+
+    private var machineScopeLabel: String {
+        switch model.machineScope {
+        case .none, DashboardModel.MachineScope.local?: return "This"
+        case DashboardModel.MachineScope.combined?: return "All"
+        case let scope?: return scope
         }
     }
 
@@ -340,6 +409,17 @@ struct PopoverView: View {
         case .ready:
             lens
         }
+    }
+
+    /// The ScrollView's direct content — pulled out of `body` so both the
+    /// macOS 26 `GlassEffectContainer` branch and the macOS 14 fallback share
+    /// one definition (adjacent glass cards fuse inside the container; on 14
+    /// this renders exactly as before).
+    @ViewBuilder private var dashboardContent: some View {
+        content
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(OverlayScrollerEnforcer())
     }
 
     /// Lens router. The client tab picks *which* data (clientIds slice), the

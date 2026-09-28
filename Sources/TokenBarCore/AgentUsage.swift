@@ -1,7 +1,7 @@
 import Foundation
 
-// OAuth quota cards (`AgentUsagePayload` in the Tauri frontend's
-// src/lib/agentUsage.ts).
+// OAuth/subscription quota cards (`AgentUsagePayload` in the Tauri
+// frontend's src/lib/agentUsage.ts).
 
 public struct AgentIdentity: Decodable, Sendable {
     public let email: String?

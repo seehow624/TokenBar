@@ -41,7 +41,7 @@ sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swif
 | 維護期優先順序 | [`current-state.md`](current-state.md) | [`history/README.md`](history/README.md) |
 | 歷史根因或已 parked 調查 | [`history/README.md`](history/README.md) | 對應的 history 文件 |
 | 穩定設計 rationale | [`decisions/0001-canonical-knowledge-base.md`](decisions/0001-canonical-knowledge-base.md)、[`decisions/0002-streaming-and-preaggregation.md`](decisions/0002-streaming-and-preaggregation.md)、[`decisions/0003-selective-upstream-alignment.md`](decisions/0003-selective-upstream-alignment.md) | `decisions/` 中對應文件 |
-| 上游 alignment 計畫 | [`plans/tokscale-alignment.md`](plans/tokscale-alignment.md) | [`vendor-tokscale.md`](vendor-tokscale.md) |
+| 上游 alignment 計畫 | [`plans/tokscale-alignment.md`](plans/tokscale-alignment.md) | [`plans/engine-sync-candidates.md`](plans/engine-sync-candidates.md) |
 
 ## Canonical tree
 
@@ -72,6 +72,7 @@ docs/knowledge/
 │   └── 0003-selective-upstream-alignment.md
 └── plans/
     ├── README.md
+    ├── engine-sync-candidates.md
     └── tokscale-alignment.md
 ```
 

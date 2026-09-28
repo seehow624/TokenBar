@@ -7,9 +7,10 @@
 //!
 //!   GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
 //!
-//! Prefer the `GrokBuild` product percent when present; fall back to overall
-//! `creditUsagePercent`. Omit the card entirely when no Grok auth is on disk
-//! (same stance as Copilot).
+//! Use the overall `creditUsagePercent` pool when present; never mistake a
+//! product share for the pool when that field is absent. The default billing
+//! view is also queried for a monthly included allowance. Omit the card entirely
+//! when no Grok auth is on disk (same stance as Copilot).
 
 use crate::agent_usage::{AgentIdentity, UsageWindow};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -19,7 +20,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const GROK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+/// Weekly SuperGrok credit pool.
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// Unified billing view containing the monthly included allowance.
+const GROK_MONTHLY_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
+/// The additive monthly request must not hold up the weekly quota card.
+const MONTHLY_TIMEOUT_SECS: u64 = 5;
 /// Refresh a few minutes early so a clock-skewed expiry doesn't 401 the billing call.
 const ACCESS_SKEW_SECS: i64 = 120;
 
@@ -55,14 +61,37 @@ struct BillingResponse {
 struct BillingConfig {
     #[serde(default)]
     current_period: Option<UsagePeriod>,
+    /// Credits-view weekly pool percentage.
     #[serde(default)]
     credit_usage_percent: Option<f64>,
     #[serde(default)]
     product_usage: Option<Vec<ProductUsage>>,
+    /// Unified-billing monthly allowance and consumption, encoded as
+    /// `{ "val": n }`.
+    #[serde(default)]
+    monthly_limit: Option<AmountValue>,
+    #[serde(default)]
+    used: Option<AmountValue>,
+    /// Some responses nest consumption under `usage.totalUsed` instead.
+    #[serde(default)]
+    usage: Option<UnifiedUsage>,
     #[serde(default)]
     billing_period_start: Option<String>,
     #[serde(default)]
     billing_period_end: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmountValue {
+    #[serde(default)]
+    val: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedUsage {
+    #[serde(default)]
+    total_used: Option<AmountValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,11 +104,11 @@ struct UsagePeriod {
     end: Option<String>,
 }
 
+/// A product's share of the overall pool. The product name is intentionally
+/// ignored: no product share can answer the shared weekly meter.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProductUsage {
-    #[serde(default)]
-    product: Option<String>,
     #[serde(default)]
     usage_percent: Option<f64>,
 }
@@ -157,7 +186,8 @@ async fn fetch_with_credentials(
                     retry_status.as_u16()
                 ));
             }
-            return map_billing(&retry_body, &credentials, now);
+            let monthly_body = fetch_monthly_best_effort(&credentials.access_token).await;
+            return map_billing(&retry_body, monthly_body.as_deref(), &credentials, now);
         }
         return Err("Grok OAuth token expired or invalid. Run `grok` to log in again.".to_string());
     }
@@ -165,11 +195,34 @@ async fn fetch_with_credentials(
         return Err(format!("Grok billing API returned {}.", status.as_u16()));
     }
 
-    map_billing(&body, &credentials, now)
+    let monthly_body = fetch_monthly_best_effort(&credentials.access_token).await;
+    map_billing(&body, monthly_body.as_deref(), &credentials, now)
+}
+
+/// Fetch the unified monthly billing view opportunistically. A missing or
+/// malformed monthly response must not hide an otherwise valid weekly card.
+async fn fetch_monthly_best_effort(access_token: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(MONTHLY_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+    let response = client
+        .get(GROK_MONTHLY_URL)
+        .bearer_auth(access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, "TokenBar")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.text().await.ok()
 }
 
 fn map_billing(
     body: &str,
+    monthly_body: Option<&str>,
     credentials: &GrokCredentials,
     now: DateTime<Utc>,
 ) -> Result<GrokData, String> {
@@ -179,13 +232,31 @@ fn map_billing(
         .config
         .ok_or_else(|| "Grok billing response missing config.".to_string())?;
 
-    let used_percent = used_percent_from_config(&config).ok_or_else(|| {
-        "Grok billing response has no creditUsagePercent or GrokBuild usage.".to_string()
-    })?;
+    let used_percent = match weekly_used_percent(&config) {
+        GrokPercent::Value(value) => value,
+        GrokPercent::Absent => {
+            return Err(
+                "Grok billing response has no usable weekly credit pool.".to_string(),
+            )
+        }
+        GrokPercent::Invalid => {
+            return Err("Grok billing response contains an invalid usage percentage.".to_string())
+        }
+    };
 
     let (label, resets_at, window_minutes) = period_meta(&config);
     let window =
         UsageWindow::from_used_percent(label, used_percent, resets_at, now, window_minutes);
+    let mut windows = vec![window];
+    if let Some(monthly_body) = monthly_body {
+        if let Ok(monthly_payload) = serde_json::from_str::<BillingResponse>(monthly_body) {
+            if let Some(config) = monthly_payload.config.as_ref() {
+                if let Some(window) = monthly_window(config, now) {
+                    windows.push(window);
+                }
+            }
+        }
+    }
 
     Ok(GrokData {
         identity: Some(AgentIdentity {
@@ -195,22 +266,44 @@ fn map_billing(
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_string()),
         }),
-        windows: vec![window],
+        windows,
     })
 }
 
-fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
-    if let Some(products) = config.product_usage.as_ref() {
-        for product in products {
-            let name = product.product.as_deref().unwrap_or("");
-            if name.eq_ignore_ascii_case("GrokBuild") {
-                if let Some(pct) = product.usage_percent {
-                    return Some(pct);
-                }
-            }
-        }
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GrokPercent {
+    Value(f64),
+    Absent,
+    Invalid,
+}
+
+fn valid_percentage(value: f64) -> Option<f64> {
+    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
+}
+
+/// The overall field is the shared weekly credit pool. Product rows are only
+/// a decomposition of that pool and can under-report depletion when the user
+/// also spends credits outside Grok Build. They can never supply the weekly
+/// value; a non-zero or malformed product value only proves that an absent pool
+/// reading must not be treated as an empty week.
+fn weekly_used_percent(config: &BillingConfig) -> GrokPercent {
+    if let Some(value) = config.credit_usage_percent {
+        return match valid_percentage(value) {
+            Some(value) => GrokPercent::Value(value),
+            None => GrokPercent::Invalid,
+        };
     }
-    config.credit_usage_percent
+
+    let product_usage_seen = config.product_usage.iter().flatten().any(|product| {
+        product
+            .usage_percent
+            .is_some_and(|value| valid_percentage(value) != Some(0.0))
+    });
+    if product_usage_seen {
+        GrokPercent::Invalid
+    } else {
+        GrokPercent::Absent
+    }
 }
 
 fn period_meta(config: &BillingConfig) -> (String, Option<DateTime<Utc>>, Option<i64>) {
@@ -249,6 +342,65 @@ fn period_meta(config: &BillingConfig) -> (String, Option<DateTime<Utc>>, Option
     };
 
     (label, end, window_minutes)
+}
+
+fn monthly_window(config: &BillingConfig, now: DateTime<Utc>) -> Option<UsageWindow> {
+    let limit = config
+        .monthly_limit
+        .as_ref()?
+        .val
+        .filter(|value| *value > 0)?;
+    let used = config
+        .used
+        .as_ref()
+        .and_then(|value| value.val)
+        .or_else(|| {
+            config
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_used.as_ref())
+                .and_then(|value| value.val)
+        })
+        .filter(|value| *value >= 0)?;
+    let used_percent = used as f64 / limit as f64 * 100.0;
+
+    let start = config
+        .billing_period_start
+        .as_deref()
+        .and_then(parse_timestamp)
+        .or_else(|| {
+            config
+                .current_period
+                .as_ref()
+                .and_then(|period| period.start.as_deref())
+                .and_then(parse_timestamp)
+        });
+    let end = config
+        .billing_period_end
+        .as_deref()
+        .and_then(parse_timestamp)
+        .or_else(|| {
+            config
+                .current_period
+                .as_ref()
+                .and_then(|period| period.end.as_deref())
+                .and_then(parse_timestamp)
+        });
+    let window_minutes = match (start, end) {
+        (Some(start), Some(end)) => {
+            let minutes = (end - start).num_minutes();
+            (minutes > 0).then_some(minutes)
+        }
+        _ => None,
+    };
+
+    Some(UsageWindow::from_used_percent(
+        "Monthly".to_string(),
+        used_percent,
+        end,
+        now,
+        window_minutes,
+    ))
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -529,7 +681,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefers_grok_build_product_percent() {
+    fn prefers_overall_credit_pool_over_product_percent() {
         let config: BillingConfig = serde_json::from_str(
             r#"{
                 "creditUsagePercent": 50.0,
@@ -540,22 +692,75 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!((used_percent_from_config(&config).unwrap() - 4.0).abs() < 0.01);
+        assert_eq!(weekly_used_percent(&config), GrokPercent::Value(50.0));
     }
 
     #[test]
-    fn falls_back_to_overall_credit_percent() {
+    fn exhausted_pool_is_not_replaced_by_product_percent() {
         let config: BillingConfig = serde_json::from_str(
             r#"{
-                "creditUsagePercent": 12.5,
+                "creditUsagePercent": 100.0,
                 "productUsage": [
-                    { "product": "GrokChat" },
-                    { "product": "GrokBuild" }
+                    { "product": "GrokChat", "usagePercent": 4.0 },
+                    { "product": "GrokBuild", "usagePercent": 96.0 }
                 ]
             }"#,
         )
         .unwrap();
-        assert!((used_percent_from_config(&config).unwrap() - 12.5).abs() < 0.01);
+        assert_eq!(weekly_used_percent(&config), GrokPercent::Value(100.0));
+    }
+
+    #[test]
+    fn product_rows_refute_an_empty_week_but_never_supply_the_pool() {
+        let usage_seen: BillingConfig = serde_json::from_str(
+            r#"{
+                "productUsage": [
+                    { "product": "GrokChat", "usagePercent": 10.0 },
+                    { "product": "GrokBuild", "usagePercent": 12.5 }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(weekly_used_percent(&usage_seen), GrokPercent::Invalid);
+
+        let all_zero: BillingConfig = serde_json::from_str(
+            r#"{
+                "productUsage": [
+                    { "product": "GrokChat", "usagePercent": 0.0 },
+                    { "product": "GrokBuild", "usagePercent": 0 }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(weekly_used_percent(&all_zero), GrokPercent::Absent);
+    }
+
+    #[test]
+    fn invalid_percentages_do_not_become_quota_values() {
+        for value in [-1.0, 101.0, f64::NAN, f64::INFINITY] {
+            let config = BillingConfig {
+                current_period: None,
+                credit_usage_percent: Some(value),
+                product_usage: Some(vec![ProductUsage {
+                    usage_percent: Some(12.5),
+                }]),
+                monthly_limit: None,
+                used: None,
+                usage: None,
+                billing_period_start: None,
+                billing_period_end: None,
+            };
+            assert_eq!(weekly_used_percent(&config), GrokPercent::Invalid);
+        }
+    }
+
+    #[test]
+    fn unified_free_response_does_not_invent_weekly_quota() {
+        let body =
+            include_str!("../../../docs/superpowers/specs/fixtures/grok-billing-unified-free.json");
+        let payload: BillingResponse = serde_json::from_str(body).unwrap();
+        let config = payload.config.as_ref().unwrap();
+        assert_eq!(weekly_used_percent(config), GrokPercent::Absent);
     }
 
     #[test]
@@ -588,7 +793,7 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-07-11T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let data = map_billing(body, &credentials, now).unwrap();
+        let data = map_billing(body, None, &credentials, now).unwrap();
         assert_eq!(data.windows.len(), 1);
         assert_eq!(data.windows[0].label_for_test(), "Weekly");
         assert!((data.windows[0].remaining_for_test() - 96.0).abs() < 0.01);
@@ -600,6 +805,71 @@ mod tests {
             data.identity.as_ref().and_then(|i| i.plan.as_deref()),
             Some("X Premium+")
         );
+    }
+
+    #[test]
+    fn maps_monthly_unified_billing_allowance() {
+        let weekly = r#"{
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-07T00:00:00Z",
+                    "end": "2026-07-14T00:00:00Z"
+                },
+                "creditUsagePercent": 20.0
+            }
+        }"#;
+        let monthly = include_str!(
+            "../../../docs/superpowers/specs/fixtures/grok-billing-unified-monthly.json"
+        );
+        let credentials = GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused"),
+            entry_key: "k".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            client_id: "c".into(),
+            expires_at: None,
+            email: None,
+            raw_json: Value::Object(Default::default()),
+        };
+        let now = DateTime::parse_from_rfc3339("2026-07-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let data = map_billing(weekly, Some(monthly), &credentials, now).unwrap();
+        assert_eq!(data.windows.len(), 2);
+        assert_eq!(data.windows[1].label_for_test(), "Monthly");
+        assert!((data.windows[1].remaining_for_test() - 95.25).abs() < 0.01);
+        assert!(data.windows[1].reset_text_for_test().is_some());
+    }
+
+    #[test]
+    fn ignores_monthly_allowance_when_limit_is_zero() {
+        let weekly = r#"{
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-07T00:00:00Z",
+                    "end": "2026-07-14T00:00:00Z"
+                },
+                "creditUsagePercent": 20.0
+            }
+        }"#;
+        let monthly = r#"{ "config": { "monthlyLimit": { "val": 0 }, "used": { "val": 0 } } }"#;
+        let credentials = GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused"),
+            entry_key: "k".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            client_id: "c".into(),
+            expires_at: None,
+            email: None,
+            raw_json: Value::Object(Default::default()),
+        };
+        let now = DateTime::parse_from_rfc3339("2026-07-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let data = map_billing(weekly, Some(monthly), &credentials, now).unwrap();
+        assert_eq!(data.windows.len(), 1);
     }
 
     #[test]
@@ -669,7 +939,9 @@ mod tests {
                 }
             }"#,
         );
-        let creds = load_credentials_from(&path).unwrap().expect("auth.x.ai entry loads");
+        let creds = load_credentials_from(&path)
+            .unwrap()
+            .expect("auth.x.ai entry loads");
         assert!(creds.entry_key.contains("auth.x.ai"));
         assert_eq!(creds.access_token, "FAKE-XAI-ACCESS");
         assert_eq!(creds.refresh_token, "FAKE-XAI-REFRESH");
@@ -744,7 +1016,10 @@ mod tests {
         let creds = load_credentials_from(&path)
             .unwrap()
             .expect("genuine auth.x.ai entry loads");
-        assert_eq!(creds.entry_key, "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828");
+        assert_eq!(
+            creds.entry_key,
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+        );
         assert_eq!(creds.access_token, "FAKE-XAI-ACCESS");
         assert_eq!(creds.refresh_token, "FAKE-XAI-REFRESH");
         assert_ne!(creds.access_token, "FAKE-LOOKALIKE-ACCESS");

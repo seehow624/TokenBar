@@ -124,6 +124,14 @@ fn contains_delimited(haystack: &str, needle: &str) -> bool {
 pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
 
+    // Ollama is a routing prefix, not part of the upstream model family. In
+    // particular, matching the `llama` in `ollama/...` would label every
+    // otherwise-unknown Ollama model as Meta. Re-run inference on the routed
+    // model so known families retain their actual providers.
+    if let Some(routed_model) = lower.strip_prefix("ollama/") {
+        return inferred_provider_from_model(routed_model);
+    }
+
     if lower.contains("claude")
         || lower.contains("anthropic")
         || contains_delimited(&lower, "opus")
@@ -169,6 +177,19 @@ pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
 
     if lower.contains("qwen") {
         return Some("qwen");
+    }
+
+    // Kimi (Moonshot AI) — `kimi`, `kimi-k2.5`, `kimi-code` variants
+    if contains_delimited(&lower, "kimi") {
+        return Some("moonshotai");
+    }
+    // MiMo (Xiaomi) — `mimo-v2.5` etc.
+    if contains_delimited(&lower, "mimo") {
+        return Some("xiaomi");
+    }
+    // GLM (Zhipu AI / Zai) — `glm-4.6`, `glm-5.2` etc.
+    if contains_delimited(&lower, "glm") {
+        return Some("zai");
     }
 
     None
@@ -287,6 +308,40 @@ mod tests {
         assert_eq!(inferred_provider_from_model("llama-3"), Some("meta"));
         assert_eq!(inferred_provider_from_model("qwen3-coder"), Some("qwen"));
         assert_eq!(inferred_provider_from_model("unknown-model"), None);
+    }
+
+    #[test]
+    fn test_inferred_provider_ignores_ollama_route_prefix() {
+        assert_eq!(inferred_provider_from_model("ollama/orca-mini"), None);
+        assert_eq!(
+            inferred_provider_from_model("ollama/qwen3-coder"),
+            Some("qwen")
+        );
+        assert_eq!(
+            inferred_provider_from_model("ollama/llama-3.3"),
+            Some("meta")
+        );
+    }
+
+    #[test]
+    fn test_inferred_provider_normalizes_kimi_mimo_and_glm() {
+        assert_eq!(
+            inferred_provider_from_model("kimi-k2.5"),
+            Some("moonshotai")
+        );
+        assert_eq!(
+            inferred_provider_from_model("moonshotai/kimi-code"),
+            Some("moonshotai")
+        );
+        assert_eq!(inferred_provider_from_model("mimo-v2.5"), Some("xiaomi"));
+        assert_eq!(inferred_provider_from_model("glm-4.6"), Some("zai"));
+    }
+
+    #[test]
+    fn test_inferred_provider_delimiters_avoid_kimi_mimo_glm_false_positives() {
+        assert_eq!(inferred_provider_from_model("kimiko"), None);
+        assert_eq!(inferred_provider_from_model("mimosa"), None);
+        assert_eq!(inferred_provider_from_model("aglm"), None);
     }
 
     #[test]

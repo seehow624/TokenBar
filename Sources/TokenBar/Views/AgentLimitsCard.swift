@@ -27,7 +27,7 @@ struct AgentLimitsCard: View {
     var reorderable = false
 
     /// Bar fills by used (true) or remaining (false).
-    @AppStorage("tokenbar.limits.asUsed") private var asUsed = false
+    @AppStorage("tokenbar.limits.asUsed") private var asUsed = true
     @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
     @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
     /// Saved drag order (shared with the "Client tabs (top bar)" order in Settings).
@@ -51,13 +51,15 @@ struct AgentLimitsCard: View {
         "claude": ["Session", "Weekly"],
         "gemini": ["Pro", "Flash"],
         "grok": ["Weekly"],
+        "ollama": ["Monthly"],
+        "minimax": ["5h", "Weekly"],
     ]
 
     /// Maps opencode subscription labels (from the backend) to the agent
     /// client ids whose quota cards represent them.
     private static let subLabelToId: [String: String] = [
         "Codex": "codex", "Claude": "claude", "Copilot": "copilot",
-        "Gemini": "antigravity",
+        "Gemini": "antigravity", "Ollama Cloud": "ollama",
     ]
 
     /// Every client id that can show a row in the multi-agent Agent-limits
@@ -252,7 +254,7 @@ struct AgentLimitsCard: View {
             if snapshot?.source == "unconfigured" {
                 setupPrompt()
             } else {
-                if let detail = detailText(snapshot) {
+                if let detail = detailText(snapshot, clientId: id) {
                     Text(detail)
                         .font(.caption2)
                         .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
@@ -350,10 +352,13 @@ struct AgentLimitsCard: View {
             .foregroundStyle(color)
     }
 
-    private func detailText(_ snapshot: AgentUsageSnapshot?) -> String? {
+    private func detailText(_ snapshot: AgentUsageSnapshot?, clientId: String) -> String? {
         guard let snapshot else { return nil }
         if let error = snapshot.error { return error }
-        let parts = [snapshot.identity?.email, snapshot.identity?.plan].compactMap(\.self)
+        var parts = [snapshot.identity?.email, snapshot.identity?.plan].compactMap(\.self)
+        if clientId == "ollama", snapshot.source == "local", snapshot.windows.isEmpty {
+            parts.append("Usage: save the ollama.com Cookie as Keychain item tokenbar-ollama-cookie")
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
@@ -464,22 +469,15 @@ struct AgentLimitsCard: View {
     private func bar(
         fillPercent: Double, color: Color, paceLeft: Double?, paceIsDeficit: Bool
     ) -> some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                Capsule().fill(.quaternary.opacity(0.6))
-                Capsule()
-                    .fill(color.opacity(0.85))
-                    .frame(width: geo.size.width * fillPercent / 100)
-                if let paceLeft {
-                    RoundedRectangle(cornerRadius: 0.75)
-                        .fill(paceIsDeficit ? Color.orange : Color.secondary)
-                        .frame(width: 1.5, height: geo.size.height + 4)
-                        .offset(x: geo.size.width * paceLeft / 100 - 0.75)
-                        .help("Expected \(Int((asUsed ? paceLeft : 100 - paceLeft).rounded()))% used by now")
-                }
-            }
-        }
-        .frame(height: 6)
+        MeterBar(
+            fraction: fillPercent / 100,
+            color: color,
+            marker: paceLeft.map { left in
+                MeterBar.Marker(
+                    fraction: left / 100,
+                    isDeficit: paceIsDeficit,
+                    help: "Expected \(Int((asUsed ? left : 100 - left).rounded()))% used by now")
+            })
     }
 
     /// The live tail reports raw client ids; quota snapshots use short ids.

@@ -16,10 +16,21 @@ BUNDLE_ID="${BUNDLE_ID:-com.nyanako.tokenbar}"
 APP_NAME="${APP_DISPLAY:-TokenBar}"
 OUT_DIR="dist"
 APP="$OUT_DIR/$APP_NAME.app"
+SWIFT_BUILD_PATH="${SWIFT_BUILD_PATH:-.build}"
+RUST_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+RUST_LIBRARY_DIR="${TOKENBAR_RUST_LIBRARY_DIR:-$RUST_TARGET_DIR/release}"
+export TOKENBAR_RUST_LIBRARY_DIR="$RUST_LIBRARY_DIR"
 
 echo "==> building release binaries"
 cargo build --release
-swift build -c release
+# SwiftPM does not track the Rust staticlib as a dependency: with no Swift
+# source changes it reuses the cached executable and silently ships stale
+# Rust code. Drop the executable whenever the staticlib is newer (same guard
+# as the Makefile's relink_if_stale).
+if [ "$RUST_LIBRARY_DIR/libtb_core_ffi.a" -nt "$SWIFT_BUILD_PATH/release/TokenBar" ]; then
+  rm -f "$SWIFT_BUILD_PATH/release/TokenBar"
+fi
+swift build -c release --build-path "$SWIFT_BUILD_PATH"
 
 echo "==> assembling $APP ($VERSION, build $BUILD_NUMBER, $BUNDLE_ID)"
 rm -rf "$APP"
@@ -29,15 +40,15 @@ mkdir -p "$OUT_DIR"
 touch "$OUT_DIR/.metadata_never_index"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
-cp .build/release/TokenBar "$APP/Contents/MacOS/TokenBar"
+cp "$SWIFT_BUILD_PATH/release/TokenBar" "$APP/Contents/MacOS/TokenBar"
 # SwiftPM resource bundle (animation frames, agent icons).
-cp -R .build/release/TokenBar_TokenBar.bundle "$APP/Contents/Resources/"
+cp -R "$SWIFT_BUILD_PATH/release/TokenBar_TokenBar.bundle" "$APP/Contents/Resources/"
 # Brand icon, shared with the Tauri app.
 if [ -f assets/icon.icns ]; then
   cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
 fi
 # Sparkle framework (SPM binary artifact).
-SPARKLE_FRAMEWORK=".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+SPARKLE_FRAMEWORK="$SWIFT_BUILD_PATH/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 if [ -d "$SPARKLE_FRAMEWORK" ]; then
   cp -R "$SPARKLE_FRAMEWORK" "$APP/Contents/Frameworks/"
 fi

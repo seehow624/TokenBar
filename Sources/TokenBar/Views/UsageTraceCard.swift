@@ -70,15 +70,7 @@ struct UsageTraceCard: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary.opacity(0.6))
-                    Capsule()
-                        .fill(Color.accentColor.opacity(0.8))
-                        .frame(width: geo.size.width * pct / 100)
-                }
-            }
-            .frame(height: 4)
+            MeterBar(fraction: pct / 100, color: .accentColor)
         }
     }
 

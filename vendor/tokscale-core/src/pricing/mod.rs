@@ -142,8 +142,26 @@ impl PricingService {
         let (litellm_result, openrouter_data) =
             tokio::join!(litellm::fetch(), openrouter::fetch_all_mapped());
 
-        let litellm_data = litellm_result.map_err(|e| e.to_string())?;
-        let litellm_data = Self::filter_litellm_data(litellm_data);
+        let (litellm_data, litellm_error) = match litellm_result {
+            Ok(data) => (Self::filter_litellm_data(data), None),
+            Err(error) => {
+                eprintln!(
+                    "[tokscale] Warning: LiteLLM pricing unavailable ({}), using other sources",
+                    error
+                );
+                (
+                    litellm::load_cached_any_age()
+                        .map(Self::filter_litellm_data)
+                        .unwrap_or_default(),
+                    Some(error.to_string()),
+                )
+            }
+        };
+
+        if litellm_data.is_empty() && openrouter_data.is_empty() {
+            return Err(litellm_error
+                .unwrap_or_else(|| "No dynamic pricing source returned usable data".to_string()));
+        }
 
         Ok(Self::new_with_custom(
             CustomPricing::load_from_default_path(),
